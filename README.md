@@ -2,7 +2,7 @@
 
 (Warning: extremely invasive, has access to your entire system.)
 
-This code is mostly AI-generated, so it's probably extremely buggy and crappy, but I didn't wanna write this myself, but the actual interesting things
+This code is mostly AI-generated, so it's probably extremely buggy and crappy, but I didn't wanna write this myself, but the actual interesting things this is also an open source project because it's AI-generated, and I don't think it should be closed-sourced if it's AI-generated. 
 
 - Has access to all of your files and can run any command on your machine and can read everything
 - It has a folder that is labeled as a watch folder. It will reference this if you ever mention anything about files, unless you directly ask it not to or to look at something outside of that file.
