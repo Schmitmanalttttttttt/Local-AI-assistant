@@ -21,4 +21,3 @@ A good GPU (I'm using a RTX 4060. You don't necessarily need a GPU this high, bu
  5. For searching Embeddings "nomic-embed-text"
  6. For TTS "Kokoro-82M"
  7. For vision screen sharing to the model "Auto-detected from Ollama"
- 8. 
