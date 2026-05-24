@@ -1,0 +1,15 @@
+# Install Ollama:
+# https://ollama.com/download/windows
+
+# Ollama Models
+ollama pull qwen2.5:1.5b
+ollama pull qwen2.5:7b
+ollama pull deepseek-r1:7b
+ollama pull nomic-embed-text
+ollama pull llama3.2-vision
+
+# Faster-Whisper
+pip install faster-whisper
+
+# Kokoro TTS
+pip install git+https://github.com/hexgrad/kokoro.git
