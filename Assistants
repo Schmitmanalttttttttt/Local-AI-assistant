@@ -71,12 +71,11 @@ import time
 import logging
 import warnings
 import ctypes
-import ctypes.wintypes
 import base64
 from io import BytesIO
 import numpy as np
 import tkinter as tk
-from tkinter import scrolledtext, filedialog, ttk
+from tkinter import scrolledtext, filedialog, ttk, messagebox
 from pathlib import Path
 from datetime import datetime
 
@@ -437,7 +436,11 @@ MEMORY_DIR = Path(__file__).parent / "memory"
 MEMORY_DIR.mkdir(exist_ok=True)
 FEEDBACK_FILE = MEMORY_DIR / "feedback.json"
 FEEDBACK_LOG  = MEMORY_DIR / "feedback_log.txt"
+EXPLICIT_MEMORY_FILE = MEMORY_DIR / "explicit_memory.json"
+PLAYBOOK_FILE        = MEMORY_DIR / "playbooks.json"
+SCHEDULED_FILE       = MEMORY_DIR / "scheduled_tasks.json"
 LAST_INTERACTION: dict = {"text": "", "raw": ""}
+_offline_mode: bool = False
 
 _POSITIVE = {
     # Direct praise
@@ -502,7 +505,7 @@ def save_feedback_entry(rating: int):
     if not LAST_INTERACTION["text"]:
         return
     timestamp = datetime.now().isoformat()
-    embedding = get_embedding(LAST_INTERACTION["text"]) if rating == 1 else []
+    embedding = get_embedding(LAST_INTERACTION["text"]) if rating > 0 else []
     entry = {
         "text": LAST_INTERACTION["text"],
         "raw": LAST_INTERACTION["raw"],
@@ -510,7 +513,6 @@ def save_feedback_entry(rating: int):
         "timestamp": timestamp,
         "embedding": embedding,
     }
-    # Machine-readable JSON (used by learning system)
     data = load_feedback()
     data["interactions"].append(entry)
     data["interactions"] = data["interactions"][-300:]
@@ -519,11 +521,11 @@ def save_feedback_entry(rating: int):
             json.dump(data, f, indent=2)
     except Exception:
         pass
-    # Human-readable TXT log
-    label = "POSITIVE 👍" if rating == 1 else "NEGATIVE 👎"
+    sign = "+" if rating > 0 else ""
+    label = f"{sign}{rating}"
     try:
         with open(FEEDBACK_LOG, "a", encoding="utf-8") as f:
-            f.write(f"\n[{timestamp}] {label}\n")
+            f.write(f"\n[{timestamp}] Rating: {label}\n")
             f.write(f"Command : {LAST_INTERACTION['text']}\n")
             f.write(f"Response: {LAST_INTERACTION['raw'][:200]}\n")
             f.write("-" * 60 + "\n")
@@ -532,7 +534,7 @@ def save_feedback_entry(rating: int):
 
 def get_learned_context(query: str = "") -> str:
     data = load_feedback()
-    good = [i for i in data["interactions"] if i.get("rating") == 1 and i.get("raw")]
+    good = [i for i in data["interactions"] if i.get("rating", 0) > 0 and i.get("raw")]
     if not good:
         return ""
 
@@ -565,6 +567,185 @@ def get_learned_context(query: str = "") -> str:
     for ex in reversed(examples):
         lines.append(f'  "{ex["text"]}" → {ex["raw"][:140]}')
     return "\n".join(lines)
+
+# -- Explicit Memory System --------------------------------------------------
+def load_explicit_memories() -> list:
+    if EXPLICIT_MEMORY_FILE.exists():
+        try:
+            with open(EXPLICIT_MEMORY_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_explicit_memory(fact: str):
+    memories = load_explicit_memories()
+    memories.append({
+        "fact": fact,
+        "embedding": get_embedding(fact),
+        "timestamp": datetime.now().isoformat(),
+    })
+    memories = memories[-500:]
+    try:
+        with open(EXPLICIT_MEMORY_FILE, "w") as f:
+            json.dump(memories, f, indent=2)
+    except Exception:
+        pass
+
+def get_relevant_memories(query: str) -> str:
+    memories = load_explicit_memories()
+    if not memories:
+        return ""
+
+    query_emb = get_embedding(query)
+    if query_emb:
+        scored = [
+            (cosine_similarity(query_emb, m.get("embedding", [])), m)
+            for m in memories if m.get("embedding")
+        ]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [m for score, m in scored[:4] if score > 0.3]
+    else:
+        # Keyword overlap fallback when embeddings unavailable
+        q_words = set(query.lower().split())
+        def _overlap(m):
+            return len(q_words & set(m["fact"].lower().split()))
+        ranked = sorted(memories, key=_overlap, reverse=True)
+        top = [m for m in ranked[:4] if _overlap(m) > 0]
+
+    if not top:
+        return ""
+    lines = ["Relevant things Schmit has asked you to remember:"]
+    for m in top:
+        lines.append(f"  - {m['fact']}")
+    return "\n".join(lines)
+
+# -- Playbook (Macro Learning) -----------------------------------------------
+def load_playbooks() -> list:
+    if PLAYBOOK_FILE.exists():
+        try:
+            with open(PLAYBOOK_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_playbook(description: str, actions: list):
+    playbooks = load_playbooks()
+    playbooks.append({
+        "description": description,
+        "actions": actions,
+        "embedding": get_embedding(description),
+        "created": datetime.now().isoformat(),
+        "used_count": 0,
+    })
+    playbooks = playbooks[-200:]
+    try:
+        with open(PLAYBOOK_FILE, "w") as f:
+            json.dump(playbooks, f, indent=2)
+    except Exception:
+        pass
+
+def get_relevant_playbooks(query: str) -> str:
+    playbooks = load_playbooks()
+    if not playbooks:
+        return ""
+    query_emb = get_embedding(query)
+    if query_emb:
+        scored = [(cosine_similarity(query_emb, p.get("embedding", [])), p)
+                  for p in playbooks if p.get("embedding")]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [p for score, p in scored[:2] if score > 0.4]
+    else:
+        top = []
+    if not top:
+        return ""
+    lines = ["Playbooks from similar past tasks (use as a starting point):"]
+    for p in top:
+        steps = " → ".join(
+            f"{a['action']}({list(a.get('args', {}).values())[0] if a.get('args') else ''})"
+            for a in p["actions"][:6]
+        )
+        lines.append(f'  "{p["description"]}" → {steps}')
+    return "\n".join(lines)
+
+# -- Task Scheduler ----------------------------------------------------------
+def load_scheduled_tasks() -> list:
+    if SCHEDULED_FILE.exists():
+        try:
+            with open(SCHEDULED_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def _save_scheduled_tasks(tasks: list):
+    try:
+        with open(SCHEDULED_FILE, "w") as f:
+            json.dump(tasks, f, indent=2)
+    except Exception:
+        pass
+
+def add_scheduled_task(description: str, interval_minutes: int) -> str:
+    tasks = load_scheduled_tasks()
+    task_id = f"task_{int(time.time())}"
+    next_run = (datetime.now() + __import__("datetime").timedelta(minutes=interval_minutes)).isoformat()
+    tasks.append({
+        "id": task_id,
+        "description": description,
+        "interval_minutes": interval_minutes,
+        "created": datetime.now().isoformat(),
+        "last_run": None,
+        "next_run": next_run,
+    })
+    _save_scheduled_tasks(tasks)
+    return task_id
+
+def cancel_scheduled_task(task_id: str) -> bool:
+    tasks = load_scheduled_tasks()
+    before = len(tasks)
+    tasks = [t for t in tasks if t["id"] != task_id]
+    _save_scheduled_tasks(tasks)
+    return len(tasks) < before
+
+class TaskScheduler:
+    def __init__(self):
+        self._thread = None
+        self._app_ref = None
+
+    def start(self, app_ref):
+        self._app_ref = app_ref
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            time.sleep(30)
+            try:
+                tasks = load_scheduled_tasks()
+                now = datetime.now().isoformat()
+                changed = False
+                for task in tasks:
+                    if task.get("next_run", "") <= now:
+                        print(f"[Scheduler] Running: {task['description']}")
+                        response = process_message(task["description"])
+                        task["last_run"] = datetime.now().isoformat()
+                        task["next_run"] = (
+                            datetime.now() +
+                            __import__("datetime").timedelta(minutes=task["interval_minutes"])
+                        ).isoformat()
+                        changed = True
+                        if self._app_ref:
+                            msg = f"⏰ Scheduled task ran: {task['description'][:60]}\n{response}"
+                            self._app_ref.root.after(0, lambda m=msg: self._app_ref._append_message("system", m))
+                if changed:
+                    _save_scheduled_tasks(tasks)
+            except Exception as e:
+                print(f"[Scheduler] Error: {e}")
+
+task_scheduler = TaskScheduler()
 
 # -- Vocal Response System ---------------------------------------------------
 def speak(text, app_instance=None):
@@ -829,8 +1010,8 @@ try:
 except ImportError:
     pass
 
-CHROME_USER_DATA = str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data")
-_DEFAULT_PROFILE = "Profile 19"
+JARVIS_BROWSER_DATA = str(Path.home() / "AppData" / "Local" / "JarvisBrowser" / "User Data")
+_DEFAULT_PROFILE = "Default"
 
 class BrowserAgent:
     def __init__(self, profile: str = _DEFAULT_PROFILE):
@@ -847,17 +1028,31 @@ class BrowserAgent:
         self.browser_thread.start()
 
     def _browser_loop(self):
-        self._start()
+        try:
+            self._start()
+        except Exception as e:
+            print(f"[Browser] Startup failed: {e}")
+            # Drain any tasks already queued so execute() doesn't hang
+            time.sleep(0.2)
+            while True:
+                try:
+                    _, _, rq = self.task_queue.get_nowait()
+                    rq.put(f"❌ Browser failed to start: {e}")
+                except queue.Empty:
+                    break
+            return
+
         while True:
             func, args, result_queue = self.task_queue.get()
-            try: result = func(*args)
+            try:
+                result = func(*args)
             except Exception:
                 try:
                     self.close()
                     self._start()
                     result = func(*args)
                 except Exception as e:
-                    result_queue.put(f"❌ Browser worker error: {e}")
+                    result_queue.put(f"❌ Browser error: {e}")
                     continue
             result_queue.put(result)
 
@@ -865,49 +1060,26 @@ class BrowserAgent:
         self.start_worker()
         result_queue = queue.Queue()
         self.task_queue.put((func, args, result_queue))
-        return result_queue.get()
-
-    def _kill_profile19_chrome(self):
-        """Kill only Chrome processes holding a lock on Profile 19 — leaves all other Chrome windows open."""
-        if PSUTIL_OK:
-            killed = 0
-            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    if (proc.info['name'] or '').lower() == 'chrome.exe':
-                        cmdline = ' '.join(proc.info['cmdline'] or [])
-                        if 'Profile 19' in cmdline:
-                            proc.kill()
-                            killed += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            if killed:
-                print(f"🧹 Closed {killed} Chrome process(es) using Profile 19")
-        else:
-            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], capture_output=True)
+        try:
+            return result_queue.get(timeout=90)
+        except queue.Empty:
+            return "❌ Browser timed out — it may have failed to start."
 
     def _start(self):
-        if self._page: return
-        if not PLAYWRIGHT_OK: raise RuntimeError("Playwright missing.")
-        # Kill only Chrome processes that are already using Profile 19 — leave the user's other Chrome windows alone
-        self._kill_profile19_chrome()
-        time.sleep(0.5)
-        # Clear lock files from both the root user data dir and the profile subfolder
-        for base in (Path(CHROME_USER_DATA), Path(CHROME_USER_DATA) / self.profile):
-            for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-                lock_path = base / lock_name
-                if lock_path.exists():
-                    try:
-                        lock_path.unlink()
-                        print(f"🧹 Cleared stale browser lock: {lock_path}")
-                    except Exception:
-                        pass
+        if self._page:
+            return
+        if not PLAYWRIGHT_OK:
+            raise RuntimeError("Playwright not installed.")
+        Path(JARVIS_BROWSER_DATA).mkdir(parents=True, exist_ok=True)
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch_persistent_context(
-            user_data_dir=CHROME_USER_DATA,
+            user_data_dir=JARVIS_BROWSER_DATA,
             headless=False,
             args=[
-                f'--profile-directory={self.profile}',
                 '--disable-blink-features=AutomationControlled',
+                '--disable-infobars',
+                '--no-first-run',
+                '--no-default-browser-check',
             ],
         )
         pages = self._browser.pages
@@ -1158,7 +1330,7 @@ class BrowserAgent:
         if self._pw: self._pw.stop()
         self._page = self._browser = self._pw = None
 
-browser_agent = BrowserAgent(profile=_DEFAULT_PROFILE)
+browser_agent = BrowserAgent()
 
 def run_browser_action(action: str, args: dict) -> str:
     try:
@@ -1176,6 +1348,8 @@ def run_browser_action(action: str, args: dict) -> str:
 
 # -- Online check & web lookup -----------------------------------------------
 def check_online() -> bool:
+    if _offline_mode:
+        return False
     try:
         requests.get("https://www.google.com", timeout=3)
         return True
@@ -1211,30 +1385,16 @@ def _get_active_window_title() -> str:
     except Exception:
         return ""
 
-def _get_active_monitor_bounds() -> tuple:
-    """Return (left, top, right, bottom) of the monitor the cursor is currently on."""
-    try:
-        pt = ctypes.wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-        monitor = ctypes.windll.user32.MonitorFromPoint(pt, 2)  # 2 = MONITOR_DEFAULTTONEAREST
-        info = ctypes.create_string_buffer(40)
-        ctypes.c_uint32.from_buffer(info, 0).value = 40  # cbSize
-        ctypes.windll.user32.GetMonitorInfoW(monitor, info)
-        # MONITORINFO layout: cbSize(4) flags(4) rcMonitor(16) rcWork(16)
-        import struct
-        _, _, l, t, r, b = struct.unpack_from("IIiiii", info.raw, 0)
-        return (l, t, r, b)
-    except Exception:
-        return None
 
 def _screenshot_b64() -> str:
     try:
         from PIL import ImageGrab
-        bounds = _get_active_monitor_bounds()
-        img = ImageGrab.grab(bbox=bounds, all_screens=True) if bounds else ImageGrab.grab()
-        img = img.resize((1280, 720))
+        img = ImageGrab.grab(all_screens=True)
+        w, h = img.size
+        scale = min(1920 / w, 1080 / h, 1.0)
+        img = img.resize((int(w * scale), int(h * scale)))
         buf = BytesIO()
-        img.save(buf, format="JPEG", quality=55)
+        img.save(buf, format="JPEG", quality=60)
         return base64.b64encode(buf.getvalue()).decode()
     except Exception:
         return ""
@@ -1250,15 +1410,26 @@ def _detect_vision_model() -> str:
         pass
     return ""
 
-def _ask_vision(b64: str, model: str) -> str:
+_VISION_BACKGROUND_Q = (
+    "Describe what is on screen in 2-3 sentences. "
+    "Include the active application name, any visible text or document content, "
+    "and what the user appears to be working on."
+)
+_VISION_DETAIL_Q = (
+    "Describe everything visible on screen in full detail. "
+    "Include: the active application, all readable text (especially document or file contents), "
+    "any error messages, UI elements, and what the user is doing."
+)
+
+def _ask_vision(b64: str, model: str, question: str = _VISION_BACKGROUND_Q, max_tokens: int = 300) -> str:
     try:
         payload = {
             "model": model,
-            "messages": [{"role": "user", "content": "In one sentence, what is the user currently doing on screen?", "images": [b64]}],
+            "messages": [{"role": "user", "content": question, "images": [b64]}],
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.1, "num_predict": max_tokens},
         }
-        r = requests.post(OLLAMA_URL, json=payload, timeout=20)
+        r = requests.post(OLLAMA_URL, json=payload, timeout=40)
         return r.json().get("message", {}).get("content", "").strip()
     except Exception:
         return ""
@@ -1304,9 +1475,10 @@ class ScreenObserver:
             try:
                 import pytesseract
                 from PIL import ImageGrab
-                bounds = _get_active_monitor_bounds()
-                img = ImageGrab.grab(bbox=bounds, all_screens=True) if bounds else ImageGrab.grab()
-                img = img.resize((960, 540))
+                img = ImageGrab.grab(all_screens=True)
+                w, h = img.size
+                scale = min(1920 / w, 1080 / h, 1.0)
+                img = img.resize((int(w * scale), int(h * scale)))
                 text = pytesseract.image_to_string(img)
                 lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 8][:6]
                 if lines:
@@ -1314,6 +1486,32 @@ class ScreenObserver:
             except Exception:
                 pass
         return " | ".join(parts)
+
+    def capture_now(self) -> str:
+        obs = self._capture()
+        if obs:
+            self._observations.append(obs)
+            if len(self._observations) > 12:
+                self._observations.pop(0)
+        return obs
+
+    def capture_now_with_question(self, question: str = _VISION_DETAIL_Q) -> str:
+        parts = []
+        win = _get_active_window_title()
+        if win:
+            parts.append(f"Active window: {win}")
+        if self._vision_model:
+            b64 = _screenshot_b64()
+            if b64:
+                answer = _ask_vision(b64, self._vision_model, question, max_tokens=600)
+                if answer:
+                    parts.append(answer)
+        obs = " | ".join(parts)
+        if obs:
+            self._observations.append(obs)
+            if len(self._observations) > 12:
+                self._observations.pop(0)
+        return obs
 
     def _loop(self, app_ref):
         tick = 0
@@ -1335,16 +1533,18 @@ class ScreenObserver:
         try:
             prompt = (
                 f"You are Jarvis, silently observing Schmit's screen.\n{ctx}\n\n"
-                "In plain English (NOT JSON), write one brief observation or useful tip "
-                "based on what Schmit is doing. If nothing notable, reply with only a period."
+                "In plain English (NOT JSON), write 1-2 sentences: what Schmit is doing and one "
+                "specific, useful observation or tip based on exactly what you can see. "
+                "Be concrete — mention specific apps, file names, or text if visible. "
+                "If there is truly nothing notable, reply with only a period."
             )
             payload = {
                 "model": OLLAMA_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
-                "options": {"temperature": 0.3},
+                "options": {"temperature": 0.3, "num_predict": 200},
             }
-            r = requests.post(OLLAMA_URL, json=payload, timeout=15)
+            r = requests.post(OLLAMA_URL, json=payload, timeout=20)
             thought = r.json().get("message", {}).get("content", "").strip()
             if thought and thought != "." and len(thought) > 8:
                 if app_ref:
@@ -1394,7 +1594,12 @@ Supported actions:
 - browse_read (Args: none)
 - browse_key (Args: "key") — Press a keyboard key: "Escape", "Enter", "Tab", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ctrl+z", "ctrl+s", etc.
 - browse_task (Args: "task")
-- web_lookup (Args: "query") — Search the web for information when you are unsure how to do something or need to look something up. Only use when online. If offline, use chat to explain the limitation.
+- web_lookup (Args: "query") — Search the web for information. Only use when NOT in offline mode.
+- schedule_task (Args: "description", "interval_minutes") — schedule a task to repeat every N minutes in the background. Use when Schmit says "every X minutes do Y", "remind me to check X", "repeat this task every N minutes".
+- list_tasks (Args: none) — list all currently scheduled background tasks with their IDs and intervals.
+- cancel_task (Args: "task_id") — cancel a scheduled task by its ID.
+- remember (Args: "fact") — store a fact in long-term memory when Schmit says "remember that...", "don't forget...", or asks you to remember anything. Write the fact as a clear, self-contained sentence.
+- look_at_screen (Args: "question") — takes a screenshot of ALL monitors, a vision model describes everything visible, then you receive that description and decide what action to take. Use whenever Schmit references something on screen: "click the next button", "look at my screen and do X", "read what's on screen", "click that button", etc. Set "question" to the full intent including any action (e.g. "Click the Next button if visible", "Read all text in the Notepad window", "Click the Sign In button on the page"). Only works when Screen Share is active. NEVER use file read/list/search for on-screen content.
 - set_voice (Args: "voice_id") — change your own TTS voice. Available voice IDs: bm_george (British Male, default), bm_lewis (British Male), bf_emma (British Female), bf_isabella (British Female), am_adam (American Male), am_michael (American Male), af_bella (American Female), af_nicole (American Female), af_sarah (American Female), af_sky (American Female). Pick the closest match to what Schmit describes.
 
 Profile notes: "my profile", "your profile", "profile 19", "eve" all refer to Profile 19 (the main/default profile).
@@ -1413,7 +1618,13 @@ Example sequence for typing in a doc: [{"action":"browse_click","args":{"target"
 CRITICAL: Every response MUST be a valid JSON object with an "action" key.
 For greetings, chitchat, or anything not a file/browser operation, always use:
 {"action": "chat", "args": {"message": "<your reply here as Jarvis>"}}
-Never respond with plain text. Never omit the "action" key."""
+Never respond with plain text. Never omit the "action" key.
+
+""" + (
+    "OFFLINE MODE IS ON — do NOT use browse_*, web_lookup, or any internet action. Politely tell Schmit if they ask for something that needs the internet."
+    if _offline_mode else
+    "ONLINE MODE — internet access is available. You may use browse_* and web_lookup freely."
+)
 
     try:
         messages = [{"role": "system", "content": system_prompt}]
@@ -1466,16 +1677,17 @@ def process_message(text: str) -> str:
     if not text:
         return ""
 
-    # Check for verbal feedback before doing anything else
-    feedback = detect_verbal_feedback(text)
-    if feedback == "positive":
-        save_feedback_entry(1)
-        return "Noted — I'll remember what worked. 👍"
-    if feedback == "negative":
-        save_feedback_entry(-1)
-        return "Got it, marking that as wrong. What would you like me to try instead? 👎"
-
     context = file_engine.get_folder_summary()
+
+    # Inject semantically relevant explicit memories
+    memories = get_relevant_memories(text)
+    if memories:
+        context += "\n\n" + memories
+
+    # Inject relevant playbooks (macro sequences for similar past tasks)
+    playbooks = get_relevant_playbooks(text)
+    if playbooks:
+        context += "\n\n" + playbooks
 
     # Inject learned patterns from past good interactions (semantic search if embeddings available)
     learned = get_learned_context(text)
@@ -1508,6 +1720,7 @@ def process_message(text: str) -> str:
     decoder = json.JSONDecoder()
     pos = 0
     executed_any = False
+    _session_actions: list = []  # track browse actions this turn for playbook saving
 
     while pos < len(raw_clean):
         while pos < len(raw_clean) and raw_clean[pos].isspace():
@@ -1534,7 +1747,15 @@ def process_message(text: str) -> str:
                 results.append(str(fallback_text) if fallback_text else "🤖 No response.")
                 continue
 
-            if action == "chat":
+            # Block all internet actions when offline mode is on
+            _internet_actions = {"web_lookup", "browse_navigate", "browse_search", "browse_click",
+                                  "browse_type", "browse_type_cursor", "browse_key", "browse_read",
+                                  "browse_screenshot", "browse_task", "look_at_screen"}
+            if _offline_mode and (action in _internet_actions or action.startswith("browse_")):
+                results.append("📵 Offline mode is on — toggle it off to use internet features.")
+                executed_any = True
+
+            elif action == "chat":
                 results.append(args.get("message", ""))
             elif action == "setfolder":
                 path = args.get("path")
@@ -1604,7 +1825,98 @@ def process_message(text: str) -> str:
                     results.append("📡 Offline — cannot search the web right now.")
                 executed_any = True
             elif action.startswith("browse_"):
-                results.append(run_browser_action(action, args))
+                result = run_browser_action(action, args)
+                results.append(result)
+                _session_actions.append({"action": action, "args": args})
+                executed_any = True
+            elif action == "look_at_screen":
+                if not screen_observer.active:
+                    results.append("📺 Screen Share is not active — enable it first so I can see your screen.")
+                else:
+                    user_question = args.get("question", "Describe what is on screen and what Schmit is doing.")
+                    # Stage 1: moondream — detailed visual description of every monitor
+                    visual_desc = screen_observer.capture_now_with_question()
+                    if visual_desc:
+                        # Stage 2: qwen — decide what action to take based on the description
+                        action_prompt = (
+                            f"You are Jarvis. Schmit asked: \"{user_question}\"\n\n"
+                            f"A vision model just described everything currently on screen:\n{visual_desc}\n\n"
+                            "Based on what is visible and what Schmit asked, respond with the correct JSON action.\n"
+                            "Available actions:\n"
+                            "  browse_click (args: target) — click a button or link by its visible text or description\n"
+                            "  browse_navigate (args: url) — open a URL\n"
+                            "  browse_type (args: selector, text) — type into an input field\n"
+                            "  browse_key (args: key) — press a keyboard key e.g. Enter, ctrl+t, Escape\n"
+                            "  browse_read (no args) — read the current page text\n"
+                            "  browse_search (args: query) — search Google\n"
+                            "  run_cmd (args: command) — run a Windows shell command\n"
+                            "  chat (args: message) — reply with a description or answer\n"
+                            "RESPOND WITH A SINGLE JSON OBJECT ONLY. No plain text outside the JSON."
+                        )
+                        try:
+                            r2 = requests.post(OLLAMA_URL, json={
+                                "model": OLLAMA_MODEL,
+                                "messages": [{"role": "user", "content": action_prompt}],
+                                "stream": False,
+                                "options": {"temperature": 0.1, "num_predict": 300},
+                            }, timeout=25)
+                            raw2 = r2.json().get("message", {}).get("content", "").strip()
+                            # Parse and dispatch the sub-action
+                            raw2 = raw2.replace("```json", "").replace("```", "").strip()
+                            if "{" in raw2:
+                                raw2 = raw2[raw2.find("{"):]
+                            try:
+                                sub = json.JSONDecoder().raw_decode(raw2)[0]
+                                sub_action = sub.get("action", "")
+                                sub_args = sub.get("args", {}) or {}
+                                if sub_action == "chat":
+                                    results.append(f"👁️ {sub_args.get('message', visual_desc)}")
+                                elif sub_action.startswith("browse_"):
+                                    results.append(run_browser_action(sub_action, sub_args))
+                                elif sub_action == "run_cmd":
+                                    results.append(file_engine.run_system_command(sub_args.get("command", "")))
+                                else:
+                                    results.append(f"👁️ {raw2 or visual_desc}")
+                            except Exception:
+                                results.append(f"👁️ {raw2 or visual_desc}")
+                        except Exception:
+                            results.append(f"👁️ {visual_desc}")
+                    else:
+                        results.append("👁️ I wasn't able to capture your screen right now.")
+                executed_any = True
+            elif action == "schedule_task":
+                desc     = args.get("description", "").strip()
+                interval = int(args.get("interval_minutes", 10))
+                if desc:
+                    tid = add_scheduled_task(desc, interval)
+                    results.append(f"⏰ Scheduled: \"{desc}\" every {interval} min (ID: {tid})")
+                else:
+                    results.append("❌ No task description provided.")
+                executed_any = True
+            elif action == "list_tasks":
+                tasks = load_scheduled_tasks()
+                if tasks:
+                    lines = ["⏰ Scheduled tasks:"]
+                    for t in tasks:
+                        lines.append(f"  [{t['id']}] every {t['interval_minutes']}min — {t['description'][:60]}")
+                    results.append("\n".join(lines))
+                else:
+                    results.append("⏰ No scheduled tasks.")
+                executed_any = True
+            elif action == "cancel_task":
+                tid = args.get("task_id", "").strip()
+                if cancel_scheduled_task(tid):
+                    results.append(f"✅ Cancelled task {tid}.")
+                else:
+                    results.append(f"❌ Task '{tid}' not found.")
+                executed_any = True
+            elif action == "remember":
+                fact = args.get("fact", "").strip()
+                if fact:
+                    save_explicit_memory(fact)
+                    results.append(f"🧠 Got it, I'll remember: {fact}")
+                else:
+                    results.append("❌ Nothing to remember — fact was empty.")
                 executed_any = True
             elif action == "set_voice":
                 global _tts_voice
@@ -1640,6 +1952,14 @@ def process_message(text: str) -> str:
                 return raw
             break
 
+    # Save a playbook if ≥2 browser actions succeeded this turn
+    if len(_session_actions) >= 2 and LAST_INTERACTION.get("text"):
+        threading.Thread(
+            target=save_playbook,
+            args=(LAST_INTERACTION["text"], _session_actions),
+            daemon=True
+        ).start()
+
     final_output = "\n\n".join(results) if results else raw
 
     CHAT_MEMORY.append({"role": "user", "content": text})
@@ -1662,7 +1982,7 @@ class AssistantApp:
     def _build_window(self):
         self.root = tk.Tk()
         self.root.title("Jarvis AI")
-        self.root.geometry("720x700")
+        self.root.geometry("980x700")
         self.root.configure(bg="#0f0f16")
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
         self.root.withdraw()
@@ -1706,8 +2026,10 @@ class AssistantApp:
         self.mic_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self.mute_btn = tk.Button(input_container, text="🔇 Voice: OFF", font=("Segoe UI Semibold", 10), bg="#222235", fg="#ff5555", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_tts)
         self.mute_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.think_btn = tk.Button(input_container, text="🧠 Think: OFF", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_think_mode)
+        self.think_btn = tk.Button(input_container, text="📺 Screen: OFF", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_think_mode)
         self.think_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.online_btn = tk.Button(input_container, text="🌐 Online", font=("Segoe UI Semibold", 10), bg="#1a3a1a", fg="#44cc66", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_online_mode)
+        self.online_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self.ptt_container = tk.Frame(self.main_frame, bg="#0f0f16")
         self.ptt_container.pack(fill=tk.X, padx=16, pady=0)
         self.ptt_btn = tk.Button(self.ptt_container, text="🎙  Hold to Talk — Release to Send",
@@ -1719,11 +2041,24 @@ class AssistantApp:
 
         feedback_bar = tk.Frame(self.main_frame, bg="#0f0f16")
         feedback_bar.pack(fill=tk.X, padx=16, pady=(0, 4))
-        tk.Label(feedback_bar, text="Rate last response:", font=("Segoe UI", 8), fg="#404054", bg="#0f0f16").pack(side=tk.LEFT)
-        tk.Button(feedback_bar, text="👍", font=("Segoe UI", 11), bg="#0f0f16", fg="#5ce1e6", bd=0, cursor="hand2",
-                  command=lambda: self._give_feedback(1)).pack(side=tk.LEFT, padx=(8, 2))
-        tk.Button(feedback_bar, text="👎", font=("Segoe UI", 11), bg="#0f0f16", fg="#ff5555", bd=0, cursor="hand2",
-                  command=lambda: self._give_feedback(-1)).pack(side=tk.LEFT, padx=2)
+        tk.Label(feedback_bar, text="Rate:", font=("Segoe UI", 8), fg="#404054", bg="#0f0f16").pack(side=tk.LEFT)
+        tk.Label(feedback_bar, text="👎", font=("Segoe UI", 10), bg="#0f0f16", fg="#ff5555").pack(side=tk.LEFT, padx=(6, 2))
+        _rating_colors = {
+            -5: "#8b0000", -4: "#bb2222", -3: "#cc4444",
+            -2: "#cc6633", -1: "#aa8833",
+             0: "#444455",
+             1: "#3388aa",  2: "#22aaaa",  3: "#11bb88",
+             4: "#33ccbb",  5: "#5ce1e6",
+        }
+        for r in range(-5, 6):
+            val = r
+            tk.Button(
+                feedback_bar, text=str(r), font=("Consolas", 8, "bold"),
+                bg=_rating_colors[r], fg="#ffffff", bd=0, cursor="hand2",
+                width=2, pady=1, relief=tk.FLAT,
+                command=lambda v=val: self._give_feedback(v)
+            ).pack(side=tk.LEFT, padx=1)
+        tk.Label(feedback_bar, text="👍", font=("Segoe UI", 10), bg="#0f0f16", fg="#5ce1e6").pack(side=tk.LEFT, padx=(2, 0))
         self.status_var = tk.StringVar(value="System Active  •  Offline Whisper Array Enabled")
         tk.Label(self.main_frame, textvariable=self.status_var, font=("Segoe UI", 8, "italic"), fg="#404054", bg="#0f0f16", anchor="w").pack(fill=tk.X, padx=18, pady=(0, 8))
         self._append_message("system", "⚡ Local Jarvis Framework Initialized. Speech Processing shifted 100% locally via Faster-Whisper.")
@@ -1736,6 +2071,7 @@ class AssistantApp:
                 self.toggle_voice_mode()
         if not config.get("tts_muted_default", True):
             self.toggle_tts()  # flip from default-muted to unmuted
+        task_scheduler.start(self)
 
     def _append_message(self, role: str, text: str):
         self.chat.config(state=tk.NORMAL)
@@ -1760,12 +2096,22 @@ class AssistantApp:
             screen_observer.start(self)
             vm = screen_observer._vision_model
             vision_note = f" · Vision model: {vm}" if vm else " · Text/window mode (no vision model found in Ollama)"
-            self.think_btn.config(text="🧠 Think: ON", bg="#7d47b2", fg="#ffffff")
-            self._append_message("system", f"🧠 Deep Think active{vision_note} — Jarvis is now watching your screen every {ScreenObserver.INTERVAL}s.")
+            self.think_btn.config(text="📺 Screen: ON", bg="#7d47b2", fg="#ffffff")
+            self._append_message("system", f"📺 Screen Share active{vision_note} — watching your screen every {ScreenObserver.INTERVAL}s.")
         else:
             screen_observer.stop()
-            self.think_btn.config(text="🧠 Think: OFF", bg="#222235", fg="#9a9ab0")
-            self._append_message("system", "🧠 Deep Think disabled.")
+            self.think_btn.config(text="📺 Screen: OFF", bg="#222235", fg="#9a9ab0")
+            self._append_message("system", "📺 Screen Share disabled.")
+
+    def toggle_online_mode(self):
+        global _offline_mode
+        _offline_mode = not _offline_mode
+        if _offline_mode:
+            self.online_btn.config(text="✈️ Offline", bg="#3a1a1a", fg="#ff7777")
+            self._append_message("system", "✈️ Offline mode ON — all internet and browser actions are blocked.")
+        else:
+            self.online_btn.config(text="🌐 Online", bg="#1a3a1a", fg="#44cc66")
+            self._append_message("system", "🌐 Online mode — internet and browser access restored.")
 
     def send(self, event=None):
         text = self.input_var.get().strip()
@@ -1792,8 +2138,17 @@ class AssistantApp:
 
     def _give_feedback(self, rating: int):
         save_feedback_entry(rating)
-        label = "👍 Good response recorded." if rating == 1 else "👎 Bad response recorded."
-        self._append_message("system", label)
+        if rating > 0:
+            icon = "👍"
+            desc = {5: "Perfect", 4: "Great", 3: "Good", 2: "Okay", 1: "Passable"}.get(rating, "Positive")
+        elif rating < 0:
+            icon = "👎"
+            desc = {-1: "Off-target", -2: "Wrong", -3: "Bad", -4: "Very bad", -5: "Completely wrong"}.get(rating, "Negative")
+        else:
+            icon = "—"
+            desc = "Neutral"
+        sign = "+" if rating > 0 else ""
+        self._append_message("system", f"{icon} Rating {sign}{rating} ({desc}) recorded.")
         self.status_var.set("Feedback saved")
         self.root.after(2000, lambda: self.status_var.set("System Active"))
 
@@ -2012,7 +2367,7 @@ class AssistantApp:
     def open_settings(self):
         win = tk.Toplevel(self.root)
         win.title("Global Settings")
-        win.geometry("500x310")
+        win.geometry("500x370")
         win.configure(bg="#0f0f16")
         win.resizable(False, False)
         win.grab_set()
@@ -2076,6 +2431,31 @@ class AssistantApp:
             activebackground="#0f0f16", activeforeground="#ffffff",
             font=("Segoe UI", 9)
         ).grid(row=3, column=1, padx=6, pady=10, sticky="w")
+
+        # ── Row 4: Clear Memory ────────────────────────────────────────────────
+        _lbl(4, "Feedback memory:")
+
+        def clear_memory():
+            if not messagebox.askyesno(
+                "Clear Memory",
+                "Are you sure?\n\nThis will permanently delete all thumbs-up/down feedback the assistant has learned from.",
+                icon="warning", parent=win
+            ):
+                return
+            for path in (FEEDBACK_FILE, FEEDBACK_LOG):
+                try:
+                    if path.exists():
+                        path.unlink()
+                except Exception:
+                    pass
+            self._append_message("system", "🗑️ Feedback memory cleared.")
+
+        tk.Button(
+            main_layer, text="🗑️ Clear Feedback Memory",
+            font=("Segoe UI", 9), bg="#3a1a1a", fg="#ff7777",
+            relief=tk.FLAT, cursor="hand2", padx=10, pady=4,
+            command=clear_memory
+        ).grid(row=4, column=1, padx=6, pady=10, sticky="w")
 
         # ── Save ───────────────────────────────────────────────────────────────
         def save():
