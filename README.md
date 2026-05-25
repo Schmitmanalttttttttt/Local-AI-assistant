@@ -21,3 +21,21 @@ A good GPU (I'm using a RTX 4060. You don't necessarily need a GPU this high, bu
  5. For searching Embeddings "nomic-embed-text"
  6. For TTS "Kokoro-82M"
  7. For vision screen sharing to the model "Auto-detected from Ollama"
+
+Installation For windows
+
+# Install Ollama:
+# https://ollama.com/download/windows
+
+# Ollama Models
+ollama pull qwen2.5:1.5b
+ollama pull qwen2.5:7b
+ollama pull deepseek-r1:7b
+ollama pull nomic-embed-text
+ollama pull llama3.2-vision
+
+# Faster-Whisper
+pip install faster-whisper
+
+# Kokoro TTS
+pip install git+https://github.com/hexgrad/kokoro.git
