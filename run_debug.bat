@@ -12,12 +12,14 @@ powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss" > "%TEMP%\jv_t
 set /p DEVTS=<"%TEMP%\jv_ts.tmp"
 del "%TEMP%\jv_ts.tmp" 2>nul
 set DEVLOG=logs\dev_%DEVTS%.log
+set CONVLOG=logs\conversation_%DEVTS%.log
 
-echo [DEV] Log : %DEVLOG%
+echo [DEV] Diagnostic log  : %DEVLOG%
+echo [DEV] Conversation log: %CONVLOG%
 echo.
 
 REM =====================================================================
-REM  STEP 1/3  -  Install / update dependencies  (verbose, no --quiet)
+REM  STEP 1/4  -  Install / update dependencies  (verbose, no --quiet)
 REM  Mirrors run.bat but shows every pip line so failures are obvious
 REM =====================================================================
 echo [1/3] Installing / verifying dependencies...
@@ -57,9 +59,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "Log '================================================================';" ^
     "Log '  DEV DIAGNOSTIC REPORT - JARVIS AI ASSISTANT';" ^
     "Log '================================================================';" ^
-    "Log ('  Started  : ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'));" ^
-    "Log ('  Log file : %DEVLOG%');" ^
-    "Log '  Flags    : PYTHONDEVMODE + all warnings + faulthandler + tracemalloc=5';" ^
+    "Log ('  Started       : ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'));" ^
+    "Log ('  Diagnostic log: %DEVLOG%');" ^
+    "Log ('  Conv log      : %CONVLOG%');" ^
+    "Log '  Flags         : PYTHONDEVMODE + all warnings + faulthandler + tracemalloc=5';" ^
     "Log '';" ^
     "Log '--- 1. SYSTEM -------------------------------------------------';" ^
     "Log ('  OS      : ' + [Environment]::OSVersion.VersionString);" ^
@@ -171,12 +174,85 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "Log ''"
 
 REM =====================================================================
-REM  STEP 3/3  -  Set debug flags and launch (plain CMD, same as run.bat)
-REM  No PowerShell pipe - tkinter GUI apps don't work through Tee-Object
+REM  BLOCK 3  -  NEW: assistant.py / audio / env / processes / ports / logs
+REM =====================================================================
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "function Log([string]$m){Write-Host $m;Add-Content '%DEVLOG%' $m -Encoding ascii};" ^
+    "Log '--- 13. ASSISTANT.PY FILE CHECK ------------------------------';" ^
+    "$ap=Join-Path (Get-Location).Path 'assistant.py';" ^
+    "if (Test-Path $ap) {" ^
+    "  $fi=Get-Item $ap;" ^
+    "  $lc=@(Get-Content $ap -ErrorAction SilentlyContinue).Count;" ^
+    "  Log ('  [OK]  Found: '+$ap);" ^
+    "  Log ('    Size     : '+[math]::Round($fi.Length/1KB,1)+' KB');" ^
+    "  Log ('    Lines    : '+$lc);" ^
+    "  Log ('    Modified : '+$fi.LastWriteTime);" ^
+    "  $syn=(python -c 'import ast; ast.parse(open(""assistant.py"",encoding=""utf-8"").read()); print(""OK"")' 2>&1);" ^
+    "  if ($LASTEXITCODE -eq 0) { Log '    Syntax   : [OK]  No parse errors' } else { Log ('    Syntax   : [!!] Parse error - check assistant.py') }" ^
+    "} else {" ^
+    "  Log '  [!!]  assistant.py NOT FOUND - cannot launch!';" ^
+    "  Log ('        Expected at: '+$ap);" ^
+    "  Log '        Ensure run_debug.bat and assistant.py are in the same folder.';" ^
+    "};" ^
+    "Log '';" ^
+    "Log '--- 14. AUDIO DEVICES (WMI) ----------------------------------';" ^
+    "try {" ^
+    "  $devs=Get-CimInstance Win32_SoundDevice -ErrorAction Stop;" ^
+    "  if ($devs) { $devs | ForEach-Object { Log ('  '+$_.Name.PadRight(42)+' Status: '+$_.Status) } }" ^
+    "  else { Log '  (no audio devices found via WMI)' }" ^
+    "} catch { Log '  [!!]  WMI audio device query failed' };" ^
+    "Log '';" ^
+    "Log '--- 15. WINDOWS AUDIO SERVICES -------------------------------';" ^
+    "foreach ($sn in @('Audiosrv','AudioEndpointBuilder','RtkAudioUniversalService')) {" ^
+    "  $svc=Get-Service -Name $sn -ErrorAction SilentlyContinue;" ^
+    "  if ($svc) { if ($svc.Status -eq 'Running') { Log ('  [OK]  '+$sn+' : Running') } else { Log ('  [!!]  '+$sn+' : '+$svc.Status+' - mic/TTS may fail') } } else { Log ('  [  ]  '+$sn+' not found') }" ^
+    "};" ^
+    "Log '';" ^
+    "Log '--- 16. PYTHON-RELEVANT ENV VARS -----------------------------';" ^
+    "foreach ($v in @('PYTHONPATH','PYTHONHOME','VIRTUAL_ENV','CONDA_DEFAULT_ENV','CONDA_PREFIX','HF_HOME','HUGGINGFACE_HUB_CACHE','TRANSFORMERS_CACHE','OLLAMA_HOST','OLLAMA_MODELS','CUDA_VISIBLE_DEVICES','CUDA_HOME')) {" ^
+    "  $val=[Environment]::GetEnvironmentVariable($v);" ^
+    "  if ($val) { Log ('  [SET] '+$v.PadRight(26)+' = '+$val) } else { Log ('  [   ] '+$v.PadRight(26)+' (not set)') }" ^
+    "};" ^
+    "Log '';" ^
+    "Log '--- 17. CONFLICTING AI / AUDIO PROCESSES --------------------';" ^
+    "Log '  (processes that may compete for mic, GPU, or hotkeys)';" ^
+    "foreach ($r in @('ollama','whisper','vosk','dragon','cortana','speechruntime','audacity','obs64','obs32','discord','teams','zoom','slack')) {" ^
+    "  $p=Get-Process -Name ('*'+$r+'*') -ErrorAction SilentlyContinue;" ^
+    "  if ($p) { Log ('  [RUN] '+$r.PadRight(20)+' PID: '+($p | Select-Object -First 1 -ExpandProperty Id)) } else { Log ('  [   ] '+$r) }" ^
+    "};" ^
+    "Log '';" ^
+    "Log '--- 18. LOCALHOST PORT SCAN ----------------------------------';" ^
+    "foreach ($port in @(11434, 8080, 5000, 7860, 3000, 8000)) {" ^
+    "  try { $t=New-Object Net.Sockets.TcpClient; $a=$t.BeginConnect('127.0.0.1',$port,$null,$null); $ok=$a.AsyncWaitHandle.WaitOne(300,$false); $t.Close();" ^
+    "    if ($ok) { Log ('  [OPEN] :'+$port) } else { Log ('  [    ] :'+$port+' closed') }" ^
+    "  } catch { Log ('  [    ] :'+$port+' closed') }" ^
+    "};" ^
+    "Log '';" ^
+    "Log '--- 19. RECENT LOG FILES IN ./logs/ --------------------------';" ^
+    "$ld=Join-Path (Get-Location).Path 'logs';" ^
+    "if (Test-Path $ld) {" ^
+    "  Get-ChildItem $ld -File | Sort-Object LastWriteTime -Descending | Select-Object -First 10 | ForEach-Object { Log ('  '+$_.Name.PadRight(40)+[math]::Round($_.Length/1KB,1)+' KB  '+$_.LastWriteTime) }" ^
+    "} else { Log '  (no logs directory yet)' };" ^
+    "Log '';" ^
+    "Log '================================================================';" ^
+    "Log '  END OF DIAGNOSTICS';" ^
+    "Log '================================================================';" ^
+    "Log ''"
+
+
+
+REM =====================================================================
+REM  STEP 4/4  -  Set debug flags and launch
+REM  No PowerShell pipe - tkinter/GUI apps don't work through Tee-Object.
+REM  We launch _dev_launcher.py which loads and runs assistant.py via
+REM  exec(), identical in behaviour to "python assistant.py".
+REM  After the assistant exits, a session-end marker is appended.
 REM =====================================================================
 echo ================================================================
 echo   [3/3] Launching assistant.py
-echo   TIP: App appears in system tray.  Close this window to stop it.
+echo   TIP:  App appears in system tray.  Close this window to stop.
+echo   LOGS: %DEVLOG%
+echo   CONV: %CONVLOG%
 echo ================================================================
 echo.
 
@@ -188,6 +264,9 @@ set PYTHONASYNCIODEBUG=1
 set PYTHONTRACEMALLOC=5
 
 python -u -W all -X dev assistant.py
+
+powershell -NoProfile -Command ^
+    "Add-Content '%CONVLOG%' ('[' + (Get-Date -Format 'HH:mm:ss') + '] [====] SESSION END ====') -Encoding UTF8" 2>nul
 
 echo.
 pause
