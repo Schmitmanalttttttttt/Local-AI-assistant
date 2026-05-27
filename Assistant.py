@@ -227,9 +227,9 @@ except ImportError:
 CONFIG_FILE = Path.home() / ".ai_assistant_config.json"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
-CHAT_MODEL   = "qwen2.5:1.5b"   # fast tier — simple chat and greetings
-OLLAMA_MODEL = "qwen2.5:7b"     # main tier — commands and normal queries
-REASON_MODEL = "deepseek-r1:7b" # deep tier — complex multi-step reasoning
+CHAT_MODEL   = "llama3.2:3b"     # fast tier — simple chat and greetings
+OLLAMA_MODEL = "qwen3:4b"        # main tier — commands and normal queries
+REASON_MODEL = "deepseek-r1:8b"  # deep tier — complex multi-step reasoning
 EMBED_MODEL  = "nomic-embed-text"
 
 _active_model = OLLAMA_MODEL  # tracks which model handled the last request
@@ -439,8 +439,13 @@ FEEDBACK_LOG  = MEMORY_DIR / "feedback_log.txt"
 EXPLICIT_MEMORY_FILE = MEMORY_DIR / "explicit_memory.json"
 PLAYBOOK_FILE        = MEMORY_DIR / "playbooks.json"
 SCHEDULED_FILE       = MEMORY_DIR / "scheduled_tasks.json"
+SCRIPTS_FILE         = MEMORY_DIR / "scripts.json"
+SCRIPTS_DIR          = Path(__file__).parent / "scripts"
+SCRIPTS_DIR.mkdir(exist_ok=True)
 LAST_INTERACTION: dict = {"text": "", "raw": ""}
 _offline_mode: bool = False
+_ui_app = None          # set after AssistantApp is constructed
+_memory_warned = False  # show the memory-size warning at most once per session
 
 _POSITIVE = {
     # Direct praise
@@ -532,7 +537,7 @@ def save_feedback_entry(rating: int):
     except Exception:
         pass
 
-def get_learned_context(query: str = "") -> str:
+def get_learned_context(query: str = "", emb: list = None) -> str:
     data = load_feedback()
     good = [i for i in data["interactions"] if i.get("rating", 0) > 0 and i.get("raw")]
     if not good:
@@ -540,7 +545,7 @@ def get_learned_context(query: str = "") -> str:
 
     if query:
         # Semantic search: embed the query and rank by similarity
-        query_emb = get_embedding(query)
+        query_emb = emb or get_embedding(query)
         if query_emb:
             scored = [
                 (cosine_similarity(query_emb, i.get("embedding", [])), i)
@@ -592,12 +597,12 @@ def save_explicit_memory(fact: str):
     except Exception:
         pass
 
-def get_relevant_memories(query: str) -> str:
+def get_relevant_memories(query: str, emb: list = None) -> str:
     memories = load_explicit_memories()
     if not memories:
         return ""
 
-    query_emb = get_embedding(query)
+    query_emb = emb or get_embedding(query)
     if query_emb:
         scored = [
             (cosine_similarity(query_emb, m.get("embedding", [])), m)
@@ -646,11 +651,11 @@ def save_playbook(description: str, actions: list):
     except Exception:
         pass
 
-def get_relevant_playbooks(query: str) -> str:
+def get_relevant_playbooks(query: str, emb: list = None) -> str:
     playbooks = load_playbooks()
     if not playbooks:
         return ""
-    query_emb = get_embedding(query)
+    query_emb = emb or get_embedding(query)
     if query_emb:
         scored = [(cosine_similarity(query_emb, p.get("embedding", [])), p)
                   for p in playbooks if p.get("embedding")]
@@ -668,6 +673,81 @@ def get_relevant_playbooks(query: str) -> str:
         )
         lines.append(f'  "{p["description"]}" → {steps}')
     return "\n".join(lines)
+
+# -- Script Trigger System ---------------------------------------------------
+def load_scripts() -> dict:
+    if SCRIPTS_FILE.exists():
+        try:
+            with open(SCRIPTS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_script(trigger: str, path: str) -> str:
+    scripts = load_scripts()
+    scripts[trigger.lower().strip()] = path
+    try:
+        with open(SCRIPTS_FILE, "w") as f:
+            json.dump(scripts, f, indent=2)
+        return f"✅ Script saved: say '{trigger}' to run {Path(path).name}"
+    except Exception as e:
+        return f"❌ Could not save script: {e}"
+
+def remove_script_entry(trigger: str) -> str:
+    scripts = load_scripts()
+    key = trigger.lower().strip()
+    if key in scripts:
+        del scripts[key]
+        with open(SCRIPTS_FILE, "w") as f:
+            json.dump(scripts, f, indent=2)
+        return f"✅ Removed script trigger: '{trigger}'"
+    return f"❌ No script found for '{trigger}'"
+
+def get_folder_scripts() -> dict:
+    """Auto-discover scripts dropped into the scripts/ folder. Trigger = filename without extension."""
+    found = {}
+    for p in SCRIPTS_DIR.iterdir():
+        if p.is_file() and p.suffix.lower() in (".bat", ".cmd", ".ps1", ".py"):
+            trigger = p.stem.lower().replace("_", " ").replace("-", " ")
+            found[trigger] = str(p)
+    return found
+
+def match_script(text: str):
+    scripts = load_scripts()
+    scripts.update(get_folder_scripts())   # folder files take second priority
+    lower = text.lower().strip()
+    if lower in scripts:
+        return scripts[lower]
+    for trigger, path in scripts.items():
+        if trigger in lower:
+            return path
+    return None
+
+def run_script(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return f"❌ Script not found: {path}"
+    ext = p.suffix.lower()
+    try:
+        if ext in (".bat", ".cmd"):
+            result = subprocess.run(["cmd", "/c", str(p)], capture_output=True, text=True, timeout=60,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+        elif ext == ".ps1":
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(p)],
+                capture_output=True, text=True, timeout=60,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+        elif ext == ".py":
+            result = subprocess.run([sys.executable, str(p)], capture_output=True, text=True, timeout=60)
+        else:
+            return f"❌ Unsupported script type: {ext}. Use .bat, .cmd, .ps1, or .py"
+        out = (result.stdout or result.stderr or "(no output)").strip()
+        return f"🚀 Ran {p.name}:\n{out[:600]}"
+    except subprocess.TimeoutExpired:
+        return f"⏱️ Script timed out after 60s: {p.name}"
+    except Exception as e:
+        return f"❌ Script error: {e}"
 
 # -- Task Scheduler ----------------------------------------------------------
 def load_scheduled_tasks() -> list:
@@ -908,12 +988,39 @@ class FileEngine:
         except Exception as e: return f"❌ Could not read file: {e}"
 
     def search_files(self, pattern: str) -> str:
-        if not self.folder or not self.folder.exists(): return "❌ Watched folder not set."
-        clean_pattern = pattern.replace("*", "").strip()
-        if not clean_pattern: return "❓ Search query blank."
-        matches = list(self.folder.rglob(f"*{clean_pattern}*"))
-        if not matches: return f"🔍 No files matching '{clean_pattern}' found."
-        lines = [f"  📄 {m.relative_to(self.folder)}" for m in matches[:50]]
+        clean = pattern.replace("*", "").strip()
+        if not clean:
+            return "❓ Search query blank."
+        words = [w.lower() for w in clean.split() if len(w) > 1]
+        home = Path.home()
+        search_dirs = []
+        for name in ("Desktop", "Downloads", "Documents"):
+            p = home / name
+            if p.exists():
+                search_dirs.append(p)
+        for od in (home / "OneDrive" / "Desktop", home / "OneDrive"):
+            if od.exists():
+                search_dirs.append(od)
+                break
+        if self.folder and self.folder.exists():
+            search_dirs.append(self.folder)
+        seen, matches = set(), []
+        for d in search_dirs:
+            try:
+                for f in d.rglob("*"):
+                    if not f.is_file() or str(f) in seen:
+                        continue
+                    nl = f.name.lower()
+                    if any(w in nl for w in words):
+                        seen.add(str(f))
+                        matches.append(f)
+                        if len(matches) >= 30:
+                            break
+            except (PermissionError, OSError):
+                pass
+        if not matches:
+            return f"🔍 No files matching '{clean}' found in Desktop, Downloads, Documents, or watched folder."
+        lines = [f"  📄 {m}" for m in matches[:20]]
         return f"🔍 Found {len(matches)} match(es):\n" + "\n".join(lines)
 
     def get_folder_summary(self) -> str:
@@ -1373,6 +1480,143 @@ def web_lookup(query: str) -> str:
     except Exception as e:
         return f"❌ Web lookup failed: {e}"
 
+# -- Enhanced Web Search Tools -----------------------------------------------
+def web_search_ddg(query: str) -> str:
+    """Two-stage DDG search: JSON instant-answer API first, HTML scrape as fallback."""
+    import re
+    print(f"[WebSearch] Query: {query}")
+
+    def _clean(s):
+        s = re.sub(r"<[^>]+>", "", s)
+        return re.sub(r"\s+", " ",
+            s.replace("&amp;", "&").replace("&quot;", '"')
+             .replace("&#x27;", "'").replace("&gt;", ">").replace("&lt;", "<")
+        ).strip()
+
+    # ── Stage 1: DDG JSON instant-answer API ─────────────────────────────────
+    try:
+        r = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; JarvisAI/1.0)"},
+            timeout=10,
+        )
+        data = r.json()
+        parts = []
+
+        answer = data.get("Answer", "").strip()
+        if answer:
+            parts.append(f"✅ {_clean(answer)}")
+
+        abstract = data.get("AbstractText", "").strip()
+        src = data.get("AbstractSource", "")
+        if abstract:
+            prefix = f"{src}: " if src else ""
+            parts.append(f"📌 {prefix}{abstract[:500]}")
+
+        definition = data.get("Definition", "").strip()
+        if definition and definition not in abstract:
+            parts.append(f"📖 {definition[:300]}")
+
+        topics = []
+        for t in data.get("RelatedTopics", []):
+            if isinstance(t, dict):
+                if t.get("Text"):
+                    topics.append(f"• {t['Text'][:180]}")
+                elif t.get("Topics"):
+                    for sub in t["Topics"][:2]:
+                        if sub.get("Text"):
+                            topics.append(f"• {sub['Text'][:180]}")
+            if len(topics) >= 5:
+                break
+        if topics:
+            parts.append("Related:\n" + "\n".join(topics[:5]))
+
+        if parts:
+            print(f"[WebSearch] DDG JSON: {len(parts)} section(s) found.")
+            return f'🔍 Results for "{query}":\n' + "\n\n".join(parts)
+    except Exception as e:
+        print(f"[WebSearch] DDG JSON error: {e}")
+
+    # ── Stage 2: DDG HTML scrape ──────────────────────────────────────────────
+    print("[WebSearch] JSON empty — trying HTML scrape...")
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+        })
+        hr = session.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "kl": "us-en"},
+            timeout=12,
+        )
+        # DDG HTML structure uses <a class="result__a"> and <a class="result__snippet">
+        titles   = re.findall(r'class="result__a"\s[^>]*>(.*?)</a>',   hr.text, re.DOTALL)
+        snippets = re.findall(r'class="result__snippet"\s[^>]*>(.*?)</a>', hr.text, re.DOTALL)
+        results  = []
+        for t, s in zip(titles[:5], snippets[:5]):
+            ct, cs = _clean(t), _clean(s)
+            if ct and cs:
+                results.append(f"• {ct}: {cs}")
+        if results:
+            print(f"[WebSearch] HTML scrape: {len(results)} results.")
+            return f'🔍 Results for "{query}":\n' + "\n".join(results)
+        print(f"[WebSearch] HTML scrape: 0 results. Response length={len(hr.text)}")
+    except Exception as e:
+        print(f"[WebSearch] HTML scrape error: {e}")
+
+    return f'🔍 No results found for "{query}". Try more specific terms.'
+
+def wiki_lookup(query: str) -> str:
+    """Wikipedia REST API — fast, clean encyclopedia summaries."""
+    print(f"[Wikipedia] Query: {query}")
+    try:
+        search_r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "search", "srsearch": query,
+                    "format": "json", "srlimit": 1},
+            timeout=8,
+        )
+        results = search_r.json().get("query", {}).get("search", [])
+        if not results:
+            return f"📖 No Wikipedia article found for '{query}'."
+        title = results[0]["title"]
+        summ_r = requests.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}",
+            timeout=8,
+        )
+        extract = summ_r.json().get("extract", "").strip()
+        if extract:
+            return f"📖 Wikipedia — {title}:\n{extract[:900]}"
+        return f"📖 No summary available for '{title}'."
+    except Exception as e:
+        return f"❌ Wikipedia lookup failed: {e}"
+
+def fetch_url(url: str) -> str:
+    """Fetch any webpage and return its readable text content."""
+    import re
+    try:
+        if not url.startswith("http"):
+            url = "https://" + url
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = requests.get(url, headers=headers, timeout=14)
+        text = r.text
+        text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<style[^>]*>.*?</style>",  " ", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"&[a-zA-Z#0-9]+;", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return "⚠️ Could not extract readable text from that page."
+        if len(text) > 4000:
+            text = text[:4000] + "…[truncated]"
+        return f"🌐 Content from {url}:\n{text}"
+    except Exception as e:
+        return f"❌ Could not fetch URL: {e}"
+
 # -- Screen Observer (Deep Think / Proactive Mode) ---------------------------
 
 def _get_active_window_title() -> str:
@@ -1601,6 +1845,13 @@ Supported actions:
 - remember (Args: "fact") — store a fact in long-term memory when Schmit says "remember that...", "don't forget...", or asks you to remember anything. Write the fact as a clear, self-contained sentence.
 - look_at_screen (Args: "question") — takes a screenshot of ALL monitors, a vision model describes everything visible, then you receive that description and decide what action to take. Use whenever Schmit references something on screen: "click the next button", "look at my screen and do X", "read what's on screen", "click that button", etc. Set "question" to the full intent including any action (e.g. "Click the Next button if visible", "Read all text in the Notepad window", "Click the Sign In button on the page"). Only works when Screen Share is active. NEVER use file read/list/search for on-screen content.
 - set_voice (Args: "voice_id") — change your own TTS voice. Available voice IDs: bm_george (British Male, default), bm_lewis (British Male), bf_emma (British Female), bf_isabella (British Female), am_adam (American Male), am_michael (American Male), af_bella (American Female), af_nicole (American Female), af_sarah (American Female), af_sky (American Female). Pick the closest match to what Schmit describes.
+- web_search (Args: "query") — search the web via DuckDuckGo and return top results with titles and snippets. Use for any "search for", "look up", "find out about", "what is", "who is", or current-events questions. Faster than browser.
+- wiki_lookup (Args: "query") — look up a topic on Wikipedia. Best for factual knowledge: people, places, history, science, concepts. Returns a clean encyclopedia summary.
+- fetch_url (Args: "url") — download and read the full text of any webpage. Use when Schmit gives a specific URL to read, or when you need to read an article or page in full.
+- add_script (Args: "trigger", "path") — save a script shortcut: when Schmit says [trigger], run the script at [path]. Supports .bat, .cmd, .ps1, .py files. Use when Schmit says "when I say X run Y", "save a script", or "add a shortcut".
+- list_scripts (Args: none) — show all saved script triggers and their file paths.
+- remove_script (Args: "trigger") — delete a saved script trigger mapping.
+- run_script (Args: "trigger") — run a saved script by its trigger phrase.
 
 Profile notes: "my profile", "your profile", "profile 19", "eve" all refer to Profile 19 (the main/default profile).
 URL shortcuts: "chatgpt" → https://chat.openai.com, "youtube" → https://www.youtube.com, "google docs" or "docs" → https://docs.google.com, "gmail" → https://mail.google.com, "reddit" → https://www.reddit.com, "google" or "chrome" → https://www.google.com.
@@ -1615,15 +1866,21 @@ GOOGLE DOCS / DOCUMENT EDITORS: The document body in Google Docs is a canvas —
 3. Never confuse the document title box (top of page, small input) with the document body (large canvas area in the center).
 Example sequence for typing in a doc: [{"action":"browse_click","args":{"target":"document body"}},{"action":"browse_type_cursor","args":{"text":"Your text here"}}]
 
-CRITICAL: Every response MUST be a valid JSON object with an "action" key.
+CRITICAL: Every response MUST be valid JSON with an "action" key.
+For MULTI-STEP tasks (navigating + typing + submitting, etc.) emit MULTIPLE JSON objects in a single response, one per line — the executor runs them in order automatically. Example:
+{"action": "browse_navigate", "args": {"url": "https://chat.openai.com"}}
+{"action": "browse_click", "args": {"target": "Send a message"}}
+{"action": "browse_type", "args": {"selector": "auto", "text": "hello"}}
+{"action": "browse_key", "args": {"key": "Enter"}}
+Always complete the FULL sequence for any browser task — never stop after one step and wait.
 For greetings, chitchat, or anything not a file/browser operation, always use:
 {"action": "chat", "args": {"message": "<your reply here as Jarvis>"}}
 Never respond with plain text. Never omit the "action" key.
 
 """ + (
-    "OFFLINE MODE IS ON — do NOT use browse_*, web_lookup, or any internet action. Politely tell Schmit if they ask for something that needs the internet."
+    "OFFLINE MODE IS ON — do NOT use browse_*, web_lookup, look_at_screen, or any internet action. All local file/system actions (list, search, read, write, move, copy, delete, rename, mkdir, run_cmd, open_app, system_info, remember) work normally. Use them freely for local tasks."
     if _offline_mode else
-    "ONLINE MODE — internet access is available. You may use browse_* and web_lookup freely."
+    "ONLINE MODE — internet access is available. All actions including browse_* and web_lookup are available."
 )
 
     try:
@@ -1655,9 +1912,29 @@ Never respond with plain text. Never omit the "action" key.
                 "temperature": 0.0,
             },
         }
-        r = requests.post(OLLAMA_URL, json=payload, timeout=120)
-        r.raise_for_status()
-        data = r.json()
+        def _call(mdl, timeout_s):
+            payload["model"] = mdl
+            r = requests.post(OLLAMA_URL, json=payload, timeout=timeout_s)
+            r.raise_for_status()
+            return r.json()
+
+        data = None
+        fallback_notice = ""
+        try:
+            data = _call(model, 120)
+        except Exception:
+            if model != CHAT_MODEL:
+                fallback_notice = f"⚠️ {model} timed out — used {CHAT_MODEL} instead."
+                print(fallback_notice)
+                _active_model = CHAT_MODEL
+                if _ui_app is not None:
+                    _ui_app.root.after(0, lambda: _ui_app.model_label.config(text=f"🤖 {CHAT_MODEL} (fallback)"))
+                try:
+                    data = _call(CHAT_MODEL, 60)
+                except Exception:
+                    return f'{{"action": "chat", "args": {{"message": "❌ Both models timed out. Try a shorter request."}}}}'
+            else:
+                return f'{{"action": "chat", "args": {{"message": "❌ Model timed out. Ollama may be busy — please try again."}}}}'
 
         if "message" in data:
             content = data["message"]["content"].strip()
@@ -1665,6 +1942,8 @@ Never respond with plain text. Never omit the "action" key.
             if "<think>" in content:
                 import re
                 content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            if fallback_notice and _ui_app is not None:
+                _ui_app.root.after(0, lambda n=fallback_notice: _ui_app._append_message("system", n))
             return content
         return str(data)
     except Exception as e:
@@ -1679,20 +1958,39 @@ def process_message(text: str) -> str:
 
     context = file_engine.get_folder_summary()
 
+    # Only compute an embedding when there is saved data worth searching.
+    # This avoids an Ollama round-trip on every message when the data stores are empty.
+    _has_data = (
+        EXPLICIT_MEMORY_FILE.exists()
+        or PLAYBOOK_FILE.exists()
+        or (FEEDBACK_FILE.exists() and FEEDBACK_FILE.stat().st_size > 50)
+    )
+    _query_emb = get_embedding(text) if _has_data else None
+
     # Inject semantically relevant explicit memories
-    memories = get_relevant_memories(text)
+    memories = get_relevant_memories(text, emb=_query_emb)
     if memories:
         context += "\n\n" + memories
 
     # Inject relevant playbooks (macro sequences for similar past tasks)
-    playbooks = get_relevant_playbooks(text)
+    playbooks = get_relevant_playbooks(text, emb=_query_emb)
     if playbooks:
         context += "\n\n" + playbooks
 
     # Inject learned patterns from past good interactions (semantic search if embeddings available)
-    learned = get_learned_context(text)
+    learned = get_learned_context(text, emb=_query_emb)
     if learned:
         context += "\n\n" + learned
+
+    # Warn once per session when accumulated memory is getting large
+    global _memory_warned
+    if len(context) > 10_000 and not _memory_warned and _ui_app is not None:
+        _memory_warned = True
+        _ui_app.root.after(0, _ui_app._show_memory_warning)
+
+    # Cap total injected context so the model input stays manageable
+    if len(context) > 10_000:
+        context = context[:10_000] + "\n[... context trimmed ...]"
 
     # Inject live browser page context only if a browser page is already open
     if browser_agent._page and not browser_agent._page.is_closed():
@@ -1709,8 +2007,20 @@ def process_message(text: str) -> str:
         if screen_ctx:
             context += "\n\n" + screen_ctx
 
+    # Script trigger — bypass LLM entirely for exact/partial phrase matches
+    script_path = match_script(text)
+    if script_path:
+        result = run_script(script_path)
+        LAST_INTERACTION["text"] = text
+        LAST_INTERACTION["raw"] = result
+        CHAT_MEMORY.append({"role": "user", "content": text[:600]})
+        CHAT_MEMORY.append({"role": "assistant", "content": result[:600]})
+        if len(CHAT_MEMORY) > 8:
+            CHAT_MEMORY = CHAT_MEMORY[-8:]
+        return result
+
     raw = ask_local_ai(text, context)
-    
+
     # ADVANCED EXTRACTOR: Isolates true JSON boundaries even if Qwen speaks before the brackets
     raw_clean = raw.replace("```json", "").replace("```", "").strip()
     if "{" in raw_clean:
@@ -1752,7 +2062,13 @@ def process_message(text: str) -> str:
                                   "browse_type", "browse_type_cursor", "browse_key", "browse_read",
                                   "browse_screenshot", "browse_task", "look_at_screen"}
             if _offline_mode and (action in _internet_actions or action.startswith("browse_")):
-                results.append("📵 Offline mode is on — toggle it off to use internet features.")
+                # If it's a web_lookup and nothing else ran yet, redirect to local file search
+                if action == "web_lookup" and not results:
+                    query = args.get("query", text)
+                    results.append(file_engine.search_files(query))
+                elif not results:
+                    # Only show the offline warning if no other action already produced output
+                    results.append("📵 Offline mode is on — toggle it off to use internet features.")
                 executed_any = True
 
             elif action == "chat":
@@ -1794,7 +2110,7 @@ def process_message(text: str) -> str:
                 results.append(file_engine.open_application(args["app_name"]))
                 executed_any = True
             elif action == "run_cmd":
-                results.append(file_engine.run_system_command(args["command"]))
+                results.append(file_engine.run_system_command(args.get("command", "")))
                 executed_any = True
             elif action == "system_info":
                 results.append(get_system_info())
@@ -1918,6 +2234,52 @@ def process_message(text: str) -> str:
                 else:
                     results.append("❌ Nothing to remember — fact was empty.")
                 executed_any = True
+            elif action == "web_search":
+                results.append(web_search_ddg(args.get("query", "")))
+                executed_any = True
+            elif action == "wiki_lookup":
+                results.append(wiki_lookup(args.get("query", "")))
+                executed_any = True
+            elif action == "fetch_url":
+                results.append(fetch_url(args.get("url", "")))
+                executed_any = True
+            elif action == "add_script":
+                trigger = args.get("trigger", "").strip()
+                path    = args.get("path", "").strip()
+                if trigger and path:
+                    results.append(save_script(trigger, path))
+                else:
+                    results.append("❌ Need both 'trigger' and 'path' to save a script.")
+                executed_any = True
+            elif action == "list_scripts":
+                saved  = load_scripts()
+                folder = get_folder_scripts()
+                lines  = []
+                if saved:
+                    lines.append("📜 Saved triggers (memory/scripts.json):")
+                    for t, p in saved.items():
+                        lines.append(f"  • say \"{t}\" → {p}")
+                if folder:
+                    lines.append(f"📁 Drop-in scripts (scripts/ folder):")
+                    for t, p in folder.items():
+                        lines.append(f"  • say \"{t}\" → {Path(p).name}")
+                if lines:
+                    results.append("\n".join(lines))
+                else:
+                    results.append(f"📜 No scripts found.\n• Drop .bat/.ps1/.py files into the scripts/ folder — they're auto-detected.\n• Or say \"when I say X, run C:\\path\\to\\script.bat\" to map a trigger manually.")
+                executed_any = True
+            elif action == "remove_script":
+                results.append(remove_script_entry(args.get("trigger", "")))
+                executed_any = True
+            elif action == "run_script":
+                trigger = args.get("trigger", "").strip()
+                scripts = load_scripts()
+                path = scripts.get(trigger.lower())
+                if path:
+                    results.append(run_script(path))
+                else:
+                    results.append(f"❌ No script found for trigger '{trigger}'. Use 'list scripts' to see saved ones.")
+                executed_any = True
             elif action == "set_voice":
                 global _tts_voice
                 requested = args.get("voice_id", "").strip().lower()
@@ -1962,10 +2324,10 @@ def process_message(text: str) -> str:
 
     final_output = "\n\n".join(results) if results else raw
 
-    CHAT_MEMORY.append({"role": "user", "content": text})
-    CHAT_MEMORY.append({"role": "assistant", "content": raw})
-    if len(CHAT_MEMORY) > 10:
-        CHAT_MEMORY = CHAT_MEMORY[-10:]
+    CHAT_MEMORY.append({"role": "user", "content": text[:600]})
+    CHAT_MEMORY.append({"role": "assistant", "content": raw[:600]})
+    if len(CHAT_MEMORY) > 8:
+        CHAT_MEMORY = CHAT_MEMORY[-8:]
 
     LAST_INTERACTION["text"] = text
     LAST_INTERACTION["raw"] = raw
@@ -2030,6 +2392,8 @@ class AssistantApp:
         self.think_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self.online_btn = tk.Button(input_container, text="🌐 Online", font=("Segoe UI Semibold", 10), bg="#1a3a1a", fg="#44cc66", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_online_mode)
         self.online_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.websearch_btn = tk.Button(input_container, text="🔍", font=("Segoe UI Semibold", 10), bg="#0f2a3a", fg="#44bbee", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.web_search_send)
+        self.websearch_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self.ptt_container = tk.Frame(self.main_frame, bg="#0f0f16")
         self.ptt_container.pack(fill=tk.X, padx=16, pady=0)
         self.ptt_btn = tk.Button(self.ptt_container, text="🎙  Hold to Talk — Release to Send",
@@ -2073,6 +2437,75 @@ class AssistantApp:
             self.toggle_tts()  # flip from default-muted to unmuted
         task_scheduler.start(self)
 
+    def _show_memory_warning(self):
+        win = tk.Toplevel(self.root)
+        win.title("Memory Getting Large")
+        win.configure(bg="#1a1a2e")
+        win.resizable(False, False)
+        win.grab_set()
+
+        # Centre over the main window
+        self.root.update_idletasks()
+        rx, ry = self.root.winfo_x(), self.root.winfo_y()
+        rw, rh = self.root.winfo_width(), self.root.winfo_height()
+        win.geometry(f"440x260+{rx + rw//2 - 220}+{ry + rh//2 - 130}")
+
+        tk.Label(win, text="⚠️  Memory Overload Warning",
+                 font=("Segoe UI Semibold", 13), fg="#ffcc44", bg="#1a1a2e"
+                 ).pack(pady=(22, 6))
+
+        tk.Label(win,
+                 text=(
+                     "Your assistant's saved memory has grown large enough\n"
+                     "to cause slow responses and unpredictable behaviour.\n\n"
+                     "Clearing it now will keep Jarvis fast and stable.\n"
+                     "You may want to copy anything important first."
+                 ),
+                 font=("Segoe UI", 10), fg="#c8c8e0", bg="#1a1a2e",
+                 justify=tk.CENTER
+                 ).pack(padx=24)
+
+        btn_row = tk.Frame(win, bg="#1a1a2e")
+        btn_row.pack(pady=22)
+
+        def do_delete():
+            global CHAT_MEMORY, _memory_warned
+            # Wipe all persistent memory stores
+            for path in (EXPLICIT_MEMORY_FILE, PLAYBOOK_FILE):
+                try:
+                    path.write_text("[]")
+                except Exception:
+                    pass
+            try:
+                feedback = load_feedback()
+                feedback["interactions"] = []
+                with open(FEEDBACK_FILE, "w") as f:
+                    json.dump(feedback, f, indent=2)
+            except Exception:
+                pass
+            CHAT_MEMORY = []
+            _memory_warned = False  # allow re-warning if it fills up again
+            win.destroy()
+            self._append_message("system",
+                "🗑️ Memory cleared — Jarvis is running clean again.")
+
+        def do_keep():
+            win.destroy()
+            self._append_message("system",
+                "⚠️ Memory kept. Performance may degrade over time.")
+
+        tk.Button(btn_row, text="🗑️  Delete Memory",
+                  font=("Segoe UI Semibold", 10), bg="#5a1a1a", fg="#ff8888",
+                  relief=tk.FLAT, cursor="hand2", padx=16, pady=7,
+                  command=do_delete
+                  ).pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Button(btn_row, text="Keep It for Now",
+                  font=("Segoe UI", 10), bg="#222235", fg="#9a9ab0",
+                  relief=tk.FLAT, cursor="hand2", padx=16, pady=7,
+                  command=do_keep
+                  ).pack(side=tk.LEFT)
+
     def _append_message(self, role: str, text: str):
         self.chat.config(state=tk.NORMAL)
         if role == "user":
@@ -2108,12 +2541,58 @@ class AssistantApp:
         _offline_mode = not _offline_mode
         if _offline_mode:
             self.online_btn.config(text="✈️ Offline", bg="#3a1a1a", fg="#ff7777")
-            self._append_message("system", "✈️ Offline mode ON — all internet and browser actions are blocked.")
+            self.websearch_btn.config(bg="#2a1a0a", fg="#cc8833")
+            self.websearch_btn.config(text="📁")
+            self._append_message("system", "✈️ Offline mode ON — 🔍 button now searches your PC files.")
         else:
             self.online_btn.config(text="🌐 Online", bg="#1a3a1a", fg="#44cc66")
-            self._append_message("system", "🌐 Online mode — internet and browser access restored.")
+            self.websearch_btn.config(bg="#0f2a3a", fg="#44bbee")
+            self.websearch_btn.config(text="🔍")
+            self._append_message("system", "🌐 Online mode — 🔍 button now searches the web.")
+
+    def web_search_send(self):
+        text = self.input_var.get().strip()
+        if not text:
+            hint = "💡 Type a filename or keyword, then click 🔍 to search your PC." if _offline_mode else "💡 Type something in the box first, then click 🔍 to search."
+            self._append_message("system", hint)
+            return
+        self.input_var.set("")
+        self.send_btn.config(state=tk.DISABLED)
+        self.websearch_btn.config(state=tk.DISABLED)
+
+        if _offline_mode:
+            self._append_message("user", f"📁 {text}")
+            self.status_var.set("Searching your PC...")
+
+            def run_local():
+                result = file_engine.search_files(text)
+                self.root.after(0, lambda: self._on_web_search_response(result))
+
+            threading.Thread(target=run_local, daemon=True).start()
+        else:
+            self._append_message("user", f"🔍 {text}")
+            self.status_var.set("Searching the web...")
+
+            def run_web():
+                ddg  = web_search_ddg(text)
+                wiki = wiki_lookup(text)
+                parts = [ddg]
+                if wiki and "No Wikipedia article" not in wiki and "failed" not in wiki.lower():
+                    parts.append(wiki)
+                self.root.after(0, lambda: self._on_web_search_response("\n\n".join(parts)))
+
+            threading.Thread(target=run_web, daemon=True).start()
+
+    def _on_web_search_response(self, text: str):
+        self._append_message("assistant", text)
+        self.status_var.set("System Active")
+        self.send_btn.config(state=tk.NORMAL)
+        self.websearch_btn.config(state=tk.NORMAL)
+        self.entry.focus()
 
     def send(self, event=None):
+        if self.send_btn['state'] == tk.DISABLED:
+            return  # already processing — ignore duplicate Enter/click
         text = self.input_var.get().strip()
         if not text:
             return
@@ -2544,6 +3023,7 @@ def start_tray(app: AssistantApp):
 
 if __name__ == "__main__":
     app = AssistantApp()
+    _ui_app = app
     register_hotkey(app)
     start_tray(app)
 
