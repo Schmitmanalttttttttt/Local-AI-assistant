@@ -1,41 +1,126 @@
-# Local-AI-assistant
+# Jarvis AI Assistant (like the one from Iron Man lol :3)
 
-(Warning: extremely invasive, has access to your entire system.)
+⚠️ Warning: This assistant has deep system access. It can execute commands, manage files, control browsers, access hardware stats, and interact with your system. Run only on a machine you own and trust.
 
-This code is mostly AI-generated, so it's probably extremely buggy and crappy, but I didn't wanna write this myself, but the actual interesting things this is also an open source project because it's AI-generated, and I don't think it should be closed-sourced if it's AI-generated. I should add this entire project will be available to all to run offline. That's the main objective of this: to have all of this run also offline. 
+A fully local AI assistant for Windows with offline voice control, browser automation, file management, camera vision, object detection, face recognition, scheduling, memory, and multi-model AI routing. No subscriptions, no cloud dependency after setup.
 
-- Has access to all of your files and can run any command on your machine and can read everything
-- It has a folder that is labeled as a watch folder. It will reference this if you ever mention anything about files, unless you directly ask it not to or to look at something outside of that file.
-- Has access to see all of your hardware and current stuff, like basically Task Manager
-- Work in progress again, AI-generated code, so probably pretty buggy.
-- Everything is being run locally on your device, you should probably have a decent GPU.
-- Just an AI assistant.
+#Features
 
-Requirements 
-A good GPU (I'm using a RTX 4060. You don't necessarily need a GPU this high, but it can definitely result in slower response times.)
- Ollama with,
- 1. For Speech-to-text	"faster-whisper small.en"
- 2. For simple conversation "qwen2.5:1.5b"
- 3. For normal standard commands or simple tasks. "qwen2.5:7b"
- 4. For in-depth reasoning. "deepseek-r1:7b"
- 5. For searching Embeddings "nomic-embed-text"
- 6. For TTS "Kokoro-82M"
- 7. For vision screen sharing to the model "Auto-detected from Ollama"
+* Offline voice input via Whisper small.en
+* Kokoro-82M text-to-speech with selectable voices
+* File management (read/write/move/delete/copy)
+* Browser automation via Playwright
+* App launcher and script runner
+* System controls (volume, processes, hardware stats, uptime, battery)
+* Task scheduling and reminders
+* Persistent memory + semantic search embeddings
+* Webcam vision with YOLOv8 object detection
+* Face recognition + DeepFace analysis
+* Optional screen observer using a vision model
+* Automatic 3-tier LLM routing for fast/normal/deep reasoning tasks
 
-Installation For windows
+#Camera & Vision
 
-# Install Ollama:
-# https://ollama.com/download/windows
+* YOLOv8 nano real-time object detection
+* 30 FPS webcam display with threaded detection
+* CPU-only inference to avoid GPU conflicts
+* Object/face detection mode selector
+* “Who” button stores known faces locally
+* Scene description support via Ollama vision models
 
-# Ollama Models
+#Requirements
+
+Somebody needs to educate me, but I'm using a laptop RTX 4070 game-ready drivers, and I'm using a Ryzen 9 AI 370. If you're equal to that, you should be fine. Anything lower than that, it'll just be slower. Use at your own risk, I guess. 
+
+#Hardware
+
+* Windows 10/11 (64-bit)
+* Python 3.9+
+* 16 GB RAM recommended
+* GPU optional but strongly recommended for faster LLM responses
+
+#Software
+
+Install Ollama:
+https://ollama.com/download/windows
+
+Ollama must be running before launching Jarvis.
+
+#Required Ollama Models
+
+```bash
 ollama pull qwen2.5:1.5b
 ollama pull qwen2.5:7b
 ollama pull deepseek-r1:7b
 ollama pull nomic-embed-text
 ollama pull llama3.2-vision
+```
 
-# Faster-Whisper
-pip install faster-whisper
+#Model Roles
 
-# Kokoro TTS
+* qwen2.5:1.5b → fast/simple replies
+* qwen2.5:7b → standard assistant tasks
+* deepseek-r1:7b → complex reasoning
+* nomic-embed-text → memory embeddings
+* llama3.2-vision → camera/screen understanding
+
+#Installation
+
+#Automatic (Recommended)
+
+Run:
+
+```bash
+run.bat
+```
+
+### Manual Dependencies
+
+```bash
+pip install faster-whisper numpy requests keyboard psutil pystray Pillow kokoro sounddevice pyaudio pycaw comtypes opencv-python deepface tf-keras ultralytics
+```
+
+If Kokoro fails:
+
+```bash
 pip install git+https://github.com/hexgrad/kokoro.git
+```
+
+#First-Run Downloads
+
+* Whisper small.en (~244 MB)
+* Kokoro-82M (~350 MB)
+* YOLOv8 nano (~6 MB)
+
+All downloads are cached locally. After setup, the assistant works fully offline.
+
+#File Structure
+
+```text
+assistant.py      - Main assistant
+run.bat           - Main launcher
+run_debug.bat     - Debug launcher
+scripts/          - Voice-triggerable scripts
+memory/           - Memory, tasks, faces, playbooks
+logs/             - Debug logs
+```
+
+#Debugging
+
+Use `run_debug.bat` for diagnostics:
+
+* Package/version checks
+* Ollama connectivity
+* Audio device checks
+* Cache status
+* Hotkey conflicts
+* Port + permission checks
+
+#Limitations
+
+* Mostly AI-generated codebase — expect bugs
+* Windows-only currently
+* DeepFace estimates are approximate
+* Ollama must already be running
+* Hotkeys may require administrator privileges
+* Camera inference intentionally runs on CPU
