@@ -1,5 +1,7 @@
 # Jarvis AI Assistant (like the one from Iron Man lol :3)
 
+Going to do an official release maybe soon-ish? I don't know. I want to get it somewhere where there's a lot more ease and capabilities that are beyond what it currently can do. I want it to be like an actual assistant before I actually make any kind of official launch. Consider this early access. (Like Subnautica 2, except really shittily written and little bit vibe coded.)
+
 ⚠️ Warning: This assistant has deep system access. It can execute commands, manage files, control browsers, access hardware stats, and interact with your system. Run only on a machine you own and trust.
 
 A fully local AI assistant for Windows with offline voice control, browser automation, file management, camera vision, object detection, face recognition, scheduling, memory, and multi-model AI routing. No subscriptions, no cloud dependency after setup.
