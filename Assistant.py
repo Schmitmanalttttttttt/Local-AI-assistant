@@ -6,6 +6,14 @@ Self-contained: run this file directly with `python assistant.py`
 Dependencies are installed automatically on first launch.
 """
 
+# ── Must be set before ANY import that could load TensorFlow's native DLL ────
+import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"]         = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"]          = "3"
+os.environ["GLOG_minloglevel"]              = "3"
+os.environ["ABSL_MIN_LOG_LEVEL"]            = "3"
+os.environ["TF_ENABLE_DEPRECATION_WARNINGS"]= "0"
+
 # ── Self-Bootstrap (runs before anything else) ───────────────────────────────
 import sys
 import subprocess
@@ -24,13 +32,26 @@ _REQUIRED_PACKAGES = [
     ("pyaudio",          "pyaudio"),
     ("pycaw",            "pycaw"),
     ("comtypes",         "comtypes"),
+    ("opencv-python",    "cv2"),
+    ("deepface",         "deepface"),
+    ("tf-keras",         "tf_keras"),
+    ("ultralytics",      "ultralytics"),
 ]
 
+# Packages that trigger heavy side-effects on import (TF loading, etc.)
+# Check via find_spec (presence only) rather than actually importing them
+_SPEC_CHECK_ONLY = {"tf_keras", "deepface"}
+
 def _bootstrap():
+    import importlib.util
     missing = []
     for pip_name, import_name in _REQUIRED_PACKAGES:
         try:
-            __import__(import_name)
+            if import_name in _SPEC_CHECK_ONLY:
+                if importlib.util.find_spec(import_name) is None:
+                    raise ImportError(import_name)
+            else:
+                __import__(import_name)
         except ImportError:
             missing.append(pip_name)
 
@@ -60,7 +81,6 @@ def _bootstrap():
 _bootstrap()
 # ─────────────────────────────────────────────────────────────────────────────
 
-import os
 import json
 import shutil
 import threading
@@ -74,6 +94,28 @@ import ctypes
 import base64
 from io import BytesIO
 import numpy as np
+
+# Silence TF Python-level deprecation noise.
+# Root-logger filters don't apply to records that propagate up from child
+# loggers, so the filter must live on each TF-family logger directly.
+class _BlockTFNoise(logging.Filter):
+    _terms = ("sparse_softmax", "tf.losses", "deprecated", "is deprecated")
+    def filter(self, record):
+        if record.levelno < logging.ERROR:
+            return False
+        msg = record.getMessage()
+        return not any(t in msg for t in self._terms)
+
+for _ln in ("tensorflow", "tensorflow.python", "tensorflow.python.util",
+            "absl", "tf_keras"):
+    _lg = logging.getLogger(_ln)
+    _lg.setLevel(logging.ERROR)
+    _lg.addFilter(_BlockTFNoise())
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="tensorflow")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="tf_keras")
+warnings.filterwarnings("ignore", message=".*sparse_softmax_cross_entropy.*")
+warnings.filterwarnings("ignore", message=r".*tf\.losses.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="tensorflow")
 import tkinter as tk
 from tkinter import scrolledtext, filedialog, ttk, messagebox
 from pathlib import Path
@@ -114,56 +156,14 @@ _KOKORO_VOICES = {
     "American Female — Sky":           "af_sky",
 }
 
-def _play_audio_wav(audio_arr: np.ndarray):
-    import wave, tempfile
-    tmp_path = None
-    try:
-        audio_int16 = (np.clip(audio_arr, -1.0, 1.0) * 32767).astype(np.int16)
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-            tmp_path = tmp.name
-        with wave.open(tmp_path, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(24000)
-            wf.writeframes(audio_int16.tobytes())
-
-        duration = len(audio_arr) / 24000.0
-        sleep_ms  = int((duration + 2.0) * 1000)
-        uri       = tmp_path.replace('\\', '/')
-
-        ps_script = (
-            "Add-Type -AssemblyName PresentationCore; "
-            "$p = [System.Windows.Media.MediaPlayer]::new(); "
-            f"$p.Open([Uri]::new('file:///{uri}')); "
-            "$p.Play(); "
-            f"Start-Sleep -Milliseconds {sleep_ms}; "
-            "$p.Close()"
-        )
-
-        _tts_stop_event.clear()
-        proc = subprocess.Popen(
-            ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps_script],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        while proc.poll() is None:
-            if _tts_stop_event.wait(timeout=0.1):
-                proc.kill()
-                break
-
-    except Exception as e:
-        print(f"[TTS] ❌ Playback error: {e}")
-    finally:
-        if tmp_path:
-            try: os.unlink(tmp_path)
-            except OSError: pass
-
 def _lang_code_for_voice(voice_id: str) -> str:
     return 'a' if voice_id.startswith('a') else 'b'
 
 def _tts_worker():
+    """Stream each Kokoro audio chunk directly to sounddevice as it is synthesized.
+    First audio plays almost immediately instead of waiting for full synthesis + PowerShell."""
     global _tts_pipeline
+    import sounddevice as sd
     from kokoro import KPipeline
     current_lang = None
 
@@ -183,17 +183,32 @@ def _tts_worker():
                 current_lang = needed_lang
                 print(f"✅ Kokoro TTS ready — voice '{voice}' active.")
             print(f"[TTS] Speaking: {text[:60]}...")
-            chunks = []
+            _tts_stop_event.clear()
+
+            play_kw = {"samplerate": 24000}
+            if _sound_device_idx is not None:
+                play_kw["device"] = _sound_device_idx
+
             for _, _, audio in _tts_pipeline(text, voice=voice, speed=1.0):
-                if app_ref and getattr(app_ref, 'tts_muted', False):
-                    chunks.clear()
+                if _tts_stop_event.is_set():
+                    sd.stop()
                     break
-                chunks.append(np.asarray(audio, dtype=np.float32))
-            if chunks:
-                _play_audio_wav(np.concatenate(chunks))
+                if app_ref and getattr(app_ref, 'tts_muted', False):
+                    sd.stop()
+                    break
+                chunk = np.asarray(audio, dtype=np.float32)
+                sd.play(chunk, **play_kw)
+                # Poll based on chunk duration so mute/stop can interrupt
+                deadline = time.time() + len(chunk) / 24000.0 + 0.05
+                while time.time() < deadline:
+                    if _tts_stop_event.is_set() or (app_ref and getattr(app_ref, 'tts_muted', False)):
+                        sd.stop()
+                        break
+                    time.sleep(0.02)
+
         except Exception as e:
             print(f"[TTS] Kokoro synthesis error: {e}")
-            current_lang = None  # force re-init on next attempt
+            current_lang = None
 
 def _start_tts_thread():
     global _tts_thread
@@ -442,6 +457,8 @@ SCHEDULED_FILE       = MEMORY_DIR / "scheduled_tasks.json"
 SCRIPTS_FILE         = MEMORY_DIR / "scripts.json"
 SCRIPTS_DIR          = Path(__file__).parent / "scripts"
 SCRIPTS_DIR.mkdir(exist_ok=True)
+KNOWN_FACES_DIR      = MEMORY_DIR / "known_faces"
+KNOWN_FACES_DIR.mkdir(exist_ok=True)
 LAST_INTERACTION: dict = {"text": "", "raw": ""}
 _offline_mode: bool = False
 _ui_app = None          # set after AssistantApp is constructed
@@ -704,24 +721,68 @@ def remove_script_entry(trigger: str) -> str:
         return f"✅ Removed script trigger: '{trigger}'"
     return f"❌ No script found for '{trigger}'"
 
+def _script_normalize(s: str) -> str:
+    import re
+    return re.sub(r'[\s\-_.,!?\'\"]+', '', s.lower())
+
+def _camel_to_words(s: str) -> str:
+    import re
+    spaced = re.sub(r'([A-Z][a-z]+)', r' \1', re.sub(r'([A-Z]+)(?=[A-Z][a-z])', r' \1', s))
+    return spaced.strip().lower()
+
 def get_folder_scripts() -> dict:
-    """Auto-discover scripts dropped into the scripts/ folder. Trigger = filename without extension."""
+    """Auto-discover scripts in scripts/ folder. Registers CamelCase and underscore variants."""
     found = {}
     for p in SCRIPTS_DIR.iterdir():
         if p.is_file() and p.suffix.lower() in (".bat", ".cmd", ".ps1", ".py"):
-            trigger = p.stem.lower().replace("_", " ").replace("-", " ")
-            found[trigger] = str(p)
+            path = str(p)
+            t1 = p.stem.lower().replace("_", " ").replace("-", " ")
+            t2 = _camel_to_words(p.stem)
+            for t in {t1, t2}:
+                if t.strip():
+                    found[t.strip()] = path
     return found
 
 def match_script(text: str):
+    import difflib
     scripts = load_scripts()
-    scripts.update(get_folder_scripts())   # folder files take second priority
+    scripts.update(get_folder_scripts())
     lower = text.lower().strip()
+
+    # 1. Exact match
     if lower in scripts:
         return scripts[lower]
+
+    # 2. Normalized — ignore all spaces (schoolwifilogin == school wifi login)
+    norm_input = _script_normalize(lower)
     for trigger, path in scripts.items():
-        if trigger in lower:
+        if _script_normalize(trigger) == norm_input:
             return path
+
+    # 3. All trigger words present somewhere in the input
+    input_words = set(lower.split())
+    best_overlap, best_path = 0, None
+    for trigger, path in scripts.items():
+        trig_words = set(trigger.split())
+        if not trig_words:
+            continue
+        overlap = len(trig_words & input_words) / len(trig_words)
+        if overlap == 1.0:
+            return path
+        if overlap > best_overlap:
+            best_overlap, best_path = overlap, path
+
+    # 4. Fuzzy similarity — catches typos and close misses
+    triggers = list(scripts.keys())
+    if triggers:
+        matches = difflib.get_close_matches(lower, triggers, n=1, cutoff=0.55)
+        if matches:
+            return scripts[matches[0]]
+
+    # 5. Best partial word-overlap above 60%
+    if best_overlap >= 0.6 and best_path:
+        return best_path
+
     return None
 
 def run_script(path: str) -> str:
@@ -1617,6 +1678,308 @@ def fetch_url(url: str) -> str:
     except Exception as e:
         return f"❌ Could not fetch URL: {e}"
 
+# -- Camera Engine (Vision / Face / Object Recognition) ---------------------
+class CameraEngine:
+    """Manages webcam capture, YOLO object detection, DeepFace analysis, and known-face recognition."""
+    YOLO_MODEL = "yolov8n.pt"   # nano — fastest, ~6 MB download on first use
+
+    def __init__(self):
+        self._cap          = None
+        self._running      = False
+        self._thread       = None
+        self._detect_thread = None
+        self._frame        = None           # latest raw BGR frame
+        self._lock         = threading.Lock()
+        self._yolo         = None
+        self._detect_mode  = "both"         # "objects" | "faces" | "both" | "none"
+        self._ui_cb        = None           # called with PIL.Image for live display
+        # Detection results written by _detection_loop, read by display loop
+        self._det_lock     = threading.Lock()
+        self._yolo_boxes   = []             # [(x1,y1,x2,y2,label,conf), ...]
+        self._face_rects   = []             # [(x,y,w,h), ...]
+        self._yolo_lock    = threading.Lock()  # prevents concurrent YOLO inference
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
+    def start(self, ui_callback=None) -> str:
+        if self._running:
+            return "📷 Camera is already running."
+        try:
+            import cv2
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                return "❌ Could not open camera. Make sure a webcam is connected."
+            self._cap  = cap
+            self._ui_cb = ui_callback
+            self._running = True
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+            self._detect_thread = threading.Thread(target=self._detection_loop, daemon=True)
+            self._detect_thread.start()
+            return "📷 Camera started."
+        except Exception as e:
+            return f"❌ Camera error: {e}"
+
+    def stop(self):
+        self._running = False
+        if self._cap:
+            try: self._cap.release()
+            except Exception: pass
+            self._cap = None
+
+    # ── Main capture loop ──────────────────────────────────────────────────
+    def _loop(self):
+        try:
+            self._loop_inner()
+        except Exception as e:
+            print(f"[Camera] ❌ Loop crashed: {e}")
+            import traceback; traceback.print_exc()
+
+    def _loop_inner(self):
+        """Display-only loop — runs at 30fps. Detection runs in _detection_loop thread."""
+        import cv2
+        from PIL import Image as _PILImg
+
+        while self._running:
+            ret, frame = self._cap.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
+            with self._lock:
+                self._frame = frame.copy()
+
+            if self._ui_cb:
+                try:
+                    display = cv2.resize(frame, (640, 480))
+                    # Read latest detection results from the detection thread
+                    with self._det_lock:
+                        yolo_boxes = list(self._yolo_boxes)
+                        face_rects = list(self._face_rects)
+                    if self._detect_mode in ("objects", "both"):
+                        for (x1, y1, x2, y2, label, conf) in yolo_boxes:
+                            cv2.rectangle(display, (x1, y1), (x2, y2), (255, 140, 0), 2)
+                            cv2.putText(display, f"{label} {conf:.2f}", (x1, y1 - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 140, 0), 1)
+                    if self._detect_mode in ("faces", "both"):
+                        for rect in face_rects:
+                            x, y, w, h = rect[0], rect[1], rect[2], rect[3]
+                            cv2.rectangle(display, (x, y), (x+w, y+h), (0, 220, 100), 2)
+                            cv2.putText(display, "Face", (x, y - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 100), 1)
+                    rgb  = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+                    pimg = _PILImg.fromarray(rgb)
+                    self._ui_cb(pimg)
+                except Exception:
+                    pass
+
+            time.sleep(0.033)   # ~30 fps
+
+    def _detection_loop(self):
+        """Runs YOLO + Haar detection as fast as hardware allows, independent of display."""
+        import cv2
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+        while self._running:
+            if self._detect_mode == "none":
+                time.sleep(0.1)
+                continue
+
+            frame = self._get_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            new_yolo  = []
+            new_faces = []
+
+            if self._detect_mode in ("objects", "both") and self._yolo is not None:
+                try:
+                    with self._yolo_lock:
+                        res = self._yolo(frame, verbose=False, conf=0.4, device='cpu')
+                    for box in res[0].boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        label = res[0].names[int(box.cls[0])]
+                        conf  = float(box.conf[0])
+                        new_yolo.append((x1, y1, x2, y2, label, conf))
+                except Exception:
+                    pass
+
+            if self._detect_mode in ("faces", "both"):
+                try:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
+                    new_faces = list(faces) if len(faces) > 0 else []
+                except Exception:
+                    pass
+
+            with self._det_lock:
+                self._yolo_boxes = new_yolo
+                self._face_rects = new_faces
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+    def _get_frame(self):
+        with self._lock:
+            return self._frame.copy() if self._frame is not None else None
+
+    def _load_yolo(self):
+        if self._yolo is None:
+            print("[Camera] Loading YOLOv8 nano model (downloads ~6 MB on first use)...")
+            from ultralytics import YOLO
+            self._yolo = YOLO(self.YOLO_MODEL)
+            print("[Camera] YOLO ready.")
+
+    def _frame_to_b64(self, frame) -> str:
+        import cv2
+        from PIL import Image as _PILImg
+        from io import BytesIO
+        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img  = _PILImg.fromarray(rgb)
+        img.thumbnail((1024, 768))
+        buf  = BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        return base64.b64encode(buf.getvalue()).decode()
+
+    # ── Public actions ─────────────────────────────────────────────────────
+    def describe_scene(self) -> str:
+        frame = self._get_frame()
+        if frame is None:
+            return "❌ Camera not started. Open the camera window first."
+        b64   = self._frame_to_b64(frame)
+        model = _detect_vision_model()
+        if not model:
+            return "❌ No vision model found. Run: ollama pull moondream"
+        desc  = _ask_vision(b64, model,
+            "Describe everything visible in this image in full detail: people, objects, text, setting.",
+            max_tokens=500)
+        return f"👁️ {desc}" if desc else "❌ Vision model returned no description."
+
+    def detect_objects(self) -> str:
+        frame = self._get_frame()
+        if frame is None:
+            return "❌ Camera not started."
+        try:
+            self._load_yolo()
+            with self._yolo_lock:
+                results = self._yolo(frame, verbose=False, conf=0.35)
+            names   = results[0].names
+            boxes   = results[0].boxes
+            if boxes is None or len(boxes) == 0:
+                return "👁️ No objects detected in the current frame."
+            counts = {}
+            for box in boxes:
+                label = names[int(box.cls[0])]
+                counts[label] = counts.get(label, 0) + 1
+            items = sorted(counts.items(), key=lambda x: -x[1])
+            return "📦 Objects detected:\n" + "\n".join(f"  • {v}× {k}" for k, v in items)
+        except Exception as e:
+            return f"❌ Object detection error: {e}"
+
+    def analyze_face(self) -> str:
+        frame = self._get_frame()
+        if frame is None:
+            return "❌ Camera not started."
+        try:
+            import sys as _sys, io as _io
+            _old_err = _sys.stderr; _sys.stderr = _io.StringIO()
+            try:
+                import deepface.DeepFace as DeepFace
+            finally:
+                _sys.stderr = _old_err
+            result = DeepFace.analyze(frame, actions=["emotion", "age", "gender"],
+                                      enforce_detection=False, silent=True)
+            if isinstance(result, list):
+                result = result[0]
+            emotion = result.get("dominant_emotion", "unknown")
+            age     = result.get("age", "?")
+            gender  = result.get("dominant_gender", result.get("gender", "?"))
+            raw_emo = result.get("emotion", {})
+            top3    = sorted(raw_emo.items(), key=lambda x: -x[1])[:3]
+            emo_str = "  ".join(f"{e}: {v:.0f}%" for e, v in top3)
+            return (f"😊 Face Analysis:\n"
+                    f"  Estimated age : ~{age}\n"
+                    f"  Gender        : {gender}\n"
+                    f"  Mood          : {emotion}\n"
+                    f"  Emotions      : {emo_str}")
+        except Exception as e:
+            return f"❌ Face analysis error: {e}"
+
+    def remember_face(self, name: str) -> str:
+        import cv2
+        if not self._running:
+            return "❌ Camera not started — open the camera window first."
+        # Wait up to 2 seconds for the first frame to arrive after camera start
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            frame = self._get_frame()
+            if frame is not None:
+                break
+            time.sleep(0.05)
+        else:
+            return "❌ Camera started but no frame received yet — try again."
+        person_dir = KNOWN_FACES_DIR / name.lower().replace(" ", "_")
+        person_dir.mkdir(exist_ok=True)
+        idx  = len(list(person_dir.glob("*.jpg"))) + 1
+        path = person_dir / f"face_{idx}.jpg"
+        cv2.imwrite(str(path), frame)
+        return f"✅ Face saved for '{name}'. I'll recognize you next time."
+
+    def identify_face(self) -> str:
+        import cv2, tempfile
+        if not self._running:
+            return "❌ Camera not started — open the camera window first."
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            frame = self._get_frame()
+            if frame is not None:
+                break
+            time.sleep(0.05)
+        else:
+            return "❌ Camera started but no frame received yet — try again."
+        subdirs = [d for d in KNOWN_FACES_DIR.iterdir() if d.is_dir()]
+        if not subdirs:
+            return "❌ No saved faces yet. Say 'remember my face as [name]' to train me."
+        try:
+            import sys as _sys, io as _io
+            _old_err = _sys.stderr; _sys.stderr = _io.StringIO()
+            try:
+                import deepface.DeepFace as DeepFace
+            finally:
+                _sys.stderr = _old_err
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp_path = tmp.name
+            cv2.imwrite(tmp_path, frame)
+            result = DeepFace.find(img_path=tmp_path,
+                                   db_path=str(KNOWN_FACES_DIR),
+                                   enforce_detection=False, silent=True)
+            try: os.unlink(tmp_path)
+            except OSError: pass
+            if result and len(result) > 0 and not result[0].empty:
+                identity_path = result[0].iloc[0]["identity"]
+                name = Path(identity_path).parent.name.replace("_", " ").title()
+                return f"👤 I recognize: {name}"
+            return "👤 Face not recognized — not in my saved faces."
+        except Exception as e:
+            return f"❌ Face identification error: {e}"
+
+    def list_known_faces(self) -> str:
+        names = [d.name.replace("_", " ").title()
+                 for d in KNOWN_FACES_DIR.iterdir() if d.is_dir()]
+        if names:
+            return "👤 Known faces:\n" + "\n".join(f"  • {n}" for n in sorted(names))
+        return "👤 No saved faces yet."
+
+    def forget_face(self, name: str) -> str:
+        import shutil
+        person_dir = KNOWN_FACES_DIR / name.lower().replace(" ", "_")
+        if person_dir.exists():
+            shutil.rmtree(person_dir)
+            return f"🗑️ Forgotten: {name}"
+        return f"❌ No saved face for '{name}'."
+
+camera_engine = CameraEngine()
+
 # -- Screen Observer (Deep Think / Proactive Mode) ---------------------------
 
 def _get_active_window_title() -> str:
@@ -1673,9 +2036,18 @@ def _ask_vision(b64: str, model: str, question: str = _VISION_BACKGROUND_Q, max_
             "stream": False,
             "options": {"temperature": 0.1, "num_predict": max_tokens},
         }
-        r = requests.post(OLLAMA_URL, json=payload, timeout=40)
-        return r.json().get("message", {}).get("content", "").strip()
-    except Exception:
+        print(f"[Vision] Asking {model}...")
+        r = requests.post(OLLAMA_URL, json=payload, timeout=90)
+        data = r.json()
+        content = data.get("message", {}).get("content", "").strip()
+        if not content:
+            err = data.get("error", "")
+            print(f"[Vision] Empty response. Error: {err!r}  Full: {str(data)[:200]}")
+        else:
+            print(f"[Vision] {len(content)} chars received.")
+        return content
+    except Exception as e:
+        print(f"[Vision] ❌ {e}")
         return ""
 
 class ScreenObserver:
@@ -1852,6 +2224,13 @@ Supported actions:
 - list_scripts (Args: none) — show all saved script triggers and their file paths.
 - remove_script (Args: "trigger") — delete a saved script trigger mapping.
 - run_script (Args: "trigger") — run a saved script by its trigger phrase.
+- camera_describe (Args: none) — take a snapshot from the webcam and describe everything visible using the vision model. Use when Schmit asks "what do you see?", "describe my room", "look at the camera".
+- camera_objects (Args: none) — detect and list all objects visible in the webcam frame using YOLO. Use when Schmit asks "what objects can you see?", "what's in front of me?", "detect objects".
+- camera_face (Args: none) — analyze the face in the webcam frame: emotion, estimated age, gender. Use for "how do I look?", "what's my mood?", "analyze my face".
+- camera_remember (Args: "name") — save the current face as a known person. Use when Schmit says "remember my face as [name]", "save my face", "learn who I am".
+- camera_identify (Args: none) — identify who is in the webcam frame by comparing to saved faces. Use for "who am I?", "do you know me?", "recognize me".
+- camera_faces_list (Args: none) — list all saved known faces.
+- camera_forget (Args: "name") — delete a saved face by name.
 
 Profile notes: "my profile", "your profile", "profile 19", "eve" all refer to Profile 19 (the main/default profile).
 URL shortcuts: "chatgpt" → https://chat.openai.com, "youtube" → https://www.youtube.com, "google docs" or "docs" → https://docs.google.com, "gmail" → https://mail.google.com, "reddit" → https://www.reddit.com, "google" or "chrome" → https://www.google.com.
@@ -1910,6 +2289,7 @@ Never respond with plain text. Never omit the "action" key.
             "options": {
                 "format": "json",
                 "temperature": 0.0,
+                "num_gpu": 999,      # force all layers onto VRAM
             },
         }
         def _call(mdl, timeout_s):
@@ -2018,6 +2398,20 @@ def process_message(text: str) -> str:
         if len(CHAT_MEMORY) > 8:
             CHAT_MEMORY = CHAT_MEMORY[-8:]
         return result
+
+    # Direct camera command intercepts — bypass LLM to avoid timeout on short phrases
+    import re as _re
+    _tl = text.lower().strip().strip("'\"")
+    _rem = _re.search(r"remember (?:my face|me) as (.+)", _tl)
+    if _rem:
+        name = _rem.group(1).strip().strip("'\"")
+        if _ui_app:
+            _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
+        return camera_engine.remember_face(name)
+    if _re.search(r"\b(who am i|recognize me|identify me|do you know me)\b", _tl):
+        if _ui_app:
+            _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
+        return camera_engine.identify_face()
 
     raw = ask_local_ai(text, context)
 
@@ -2280,6 +2674,39 @@ def process_message(text: str) -> str:
                 else:
                     results.append(f"❌ No script found for trigger '{trigger}'. Use 'list scripts' to see saved ones.")
                 executed_any = True
+            elif action == "camera_describe":
+                results.append(camera_engine.describe_scene())
+                executed_any = True
+            elif action == "camera_objects":
+                if _ui_app:
+                    _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
+                results.append(camera_engine.detect_objects())
+                executed_any = True
+            elif action == "camera_face":
+                if _ui_app:
+                    _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
+                results.append(camera_engine.analyze_face())
+                executed_any = True
+            elif action == "camera_remember":
+                name = args.get("name", "").strip()
+                if name:
+                    if _ui_app:
+                        _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
+                    results.append(camera_engine.remember_face(name))
+                else:
+                    results.append("❌ Please provide a name: 'remember my face as [name]'")
+                executed_any = True
+            elif action == "camera_identify":
+                if _ui_app:
+                    _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
+                results.append(camera_engine.identify_face())
+                executed_any = True
+            elif action == "camera_faces_list":
+                results.append(camera_engine.list_known_faces())
+                executed_any = True
+            elif action == "camera_forget":
+                results.append(camera_engine.forget_face(args.get("name", "")))
+                executed_any = True
             elif action == "set_voice":
                 global _tts_voice
                 requested = args.get("voice_id", "").strip().lower()
@@ -2311,6 +2738,12 @@ def process_message(text: str) -> str:
                 results.append(f"❌ Unknown action: {action}")
         except json.JSONDecodeError:
             if not executed_any:
+                # Try to salvage a "message" value from malformed JSON before
+                # showing raw output (llama3.2 sometimes leaves unescaped quotes)
+                import re as _re2
+                _m = _re2.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"|"message"\s*:\s*\'((?:[^\'\\]|\\.)*)\'', raw_clean)
+                if _m:
+                    return (_m.group(1) or _m.group(2)).replace("\\n", "\n")
                 return raw
             break
 
@@ -2344,7 +2777,7 @@ class AssistantApp:
     def _build_window(self):
         self.root = tk.Tk()
         self.root.title("Jarvis AI")
-        self.root.geometry("980x700")
+        self.root.geometry("1160x700")
         self.root.configure(bg="#0f0f16")
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
         self.root.withdraw()
@@ -2384,16 +2817,18 @@ class AssistantApp:
         self.voice_mode = False  # True only when mic_mode == "auto"
         self.tts_muted = True   # voice muted by default
         self._ptt_active = False
-        self.mic_btn = tk.Button(input_container, text="🎤 Mic: OFF", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=15, pady=8, command=self.toggle_voice_mode)
-        self.mic_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.mute_btn = tk.Button(input_container, text="🔇 Voice: OFF", font=("Segoe UI Semibold", 10), bg="#222235", fg="#ff5555", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_tts)
-        self.mute_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.think_btn = tk.Button(input_container, text="📺 Screen: OFF", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_think_mode)
-        self.think_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.online_btn = tk.Button(input_container, text="🌐 Online", font=("Segoe UI Semibold", 10), bg="#1a3a1a", fg="#44cc66", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_online_mode)
-        self.online_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.camera_btn = tk.Button(input_container, text="📷 Cam", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_camera)
+        self.camera_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self.websearch_btn = tk.Button(input_container, text="🔍", font=("Segoe UI Semibold", 10), bg="#0f2a3a", fg="#44bbee", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.web_search_send)
         self.websearch_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.online_btn = tk.Button(input_container, text="🌐 Online", font=("Segoe UI Semibold", 10), bg="#1a3a1a", fg="#44cc66", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_online_mode)
+        self.online_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.think_btn = tk.Button(input_container, text="📺 Screen", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_think_mode)
+        self.think_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.mute_btn = tk.Button(input_container, text="🔇 Muted", font=("Segoe UI Semibold", 10), bg="#222235", fg="#ff5555", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_tts)
+        self.mute_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        self.mic_btn = tk.Button(input_container, text="🎤 Off", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_voice_mode)
+        self.mic_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self.ptt_container = tk.Frame(self.main_frame, bg="#0f0f16")
         self.ptt_container.pack(fill=tk.X, padx=16, pady=0)
         self.ptt_btn = tk.Button(self.ptt_container, text="🎙  Hold to Talk — Release to Send",
@@ -2529,12 +2964,121 @@ class AssistantApp:
             screen_observer.start(self)
             vm = screen_observer._vision_model
             vision_note = f" · Vision model: {vm}" if vm else " · Text/window mode (no vision model found in Ollama)"
-            self.think_btn.config(text="📺 Screen: ON", bg="#7d47b2", fg="#ffffff")
+            self.think_btn.config(text="📺 Screen ON", bg="#7d47b2", fg="#ffffff")
             self._append_message("system", f"📺 Screen Share active{vision_note} — watching your screen every {ScreenObserver.INTERVAL}s.")
         else:
             screen_observer.stop()
-            self.think_btn.config(text="📺 Screen: OFF", bg="#222235", fg="#9a9ab0")
+            self.think_btn.config(text="📺 Screen", bg="#222235", fg="#9a9ab0")
             self._append_message("system", "📺 Screen Share disabled.")
+
+    def toggle_camera(self):
+        if camera_engine._running:
+            camera_engine.stop()
+            self.camera_btn.config(text="📷 Cam", bg="#222235", fg="#9a9ab0")
+            self._append_message("system", "📷 Camera stopped.")
+            if hasattr(self, '_cam_window') and self._cam_window and self._cam_window.winfo_exists():
+                self._cam_window.destroy()
+            self._cam_window = None
+        else:
+            self._open_camera_window()
+
+    def _ensure_camera_open(self):
+        if not camera_engine._running:
+            self._open_camera_window()
+
+    def _open_camera_window(self):
+        if hasattr(self, '_cam_window') and self._cam_window and self._cam_window.winfo_exists():
+            self._cam_window.lift()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Jarvis Camera")
+        win.geometry("720x580")
+        win.configure(bg="#0f0f16")
+        self._cam_window = win
+
+        # ── Controls bar ──────────────────────────────────────────────────
+        ctrl = tk.Frame(win, bg="#161623", height=44)
+        ctrl.pack(fill=tk.X)
+        ctrl.pack_propagate(False)
+
+        tk.Label(ctrl, text="Detect:", font=("Segoe UI", 9), fg="#666680", bg="#161623").pack(side=tk.LEFT, padx=(12, 4))
+        mode_var = tk.StringVar(value="both")
+        for label, val in [("Objects", "objects"), ("Faces", "faces"), ("Both", "both"), ("Off", "none")]:
+            tk.Radiobutton(ctrl, text=label, variable=mode_var, value=val,
+                           bg="#161623", fg="#9a9ab0", selectcolor="#222235",
+                           activebackground="#161623", activeforeground="#fff",
+                           font=("Segoe UI", 9),
+                           command=lambda v=mode_var: setattr(camera_engine, '_detect_mode', v.get())
+                           ).pack(side=tk.LEFT, padx=4)
+
+        for btn_text, action in [("📸 Describe", "describe"), ("😊 Face", "face"), ("📦 Objects", "objects"), ("👤 Who?", "identify")]:
+            tk.Button(ctrl, text=btn_text, font=("Segoe UI", 9), bg="#222235", fg="#9a9ab0",
+                      relief=tk.FLAT, cursor="hand2", padx=8, pady=3,
+                      command=lambda a=action: threading.Thread(target=self._cam_action, args=(a,), daemon=True).start()
+                      ).pack(side=tk.RIGHT, padx=4, pady=6)
+
+        # ── Live feed ─────────────────────────────────────────────────────
+        self._cam_label = tk.Label(win, bg="#000000", cursor="crosshair")
+        self._cam_label.pack(fill=tk.BOTH, expand=True)
+
+        # ── Status bar ────────────────────────────────────────────────────
+        self._cam_status_var = tk.StringVar(value="Starting camera…")
+        tk.Label(win, textvariable=self._cam_status_var,
+                 font=("Segoe UI", 8, "italic"), fg="#404054", bg="#0f0f16"
+                 ).pack(pady=(2, 6))
+
+        def on_close():
+            camera_engine.stop()
+            self.camera_btn.config(text="📷 Cam", bg="#222235", fg="#9a9ab0")
+            self._cam_window = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        _pending = [False]   # one-element list so the closure can mutate it
+
+        def ui_callback(pil_img):
+            # Called from camera background thread — do NO Tkinter work here.
+            # ImageTk.PhotoImage must be created on the main thread; doing it
+            # here (old code) caused random UI freezes and corruption.
+            if not win.winfo_exists():
+                return
+            if _pending[0]:          # drop frame if a UI update is already queued
+                return
+            _pending[0] = True
+            # Capture status text while still in background thread (cheap)
+            status = f"Live  •  {pil_img.width}×{pil_img.height}  •  mode: {camera_engine._detect_mode}"
+            def _update():
+                _pending[0] = False
+                if not win.winfo_exists():
+                    return
+                try:
+                    from PIL import ImageTk
+                    photo = ImageTk.PhotoImage(pil_img)   # main thread — safe
+                    self._cam_label.config(image=photo)
+                    self._cam_label.image = photo         # keep reference alive
+                    self._cam_status_var.set(status)
+                except Exception:
+                    pass
+            win.after(0, _update)
+
+        result = camera_engine.start(ui_callback=ui_callback)
+        self._append_message("system", result)
+        self.camera_btn.config(text="📷 Cam ON", bg="#1a3a1a", fg="#44cc66")
+
+    def _cam_action(self, action: str):
+        if action == "describe":
+            result = camera_engine.describe_scene()
+        elif action == "face":
+            result = camera_engine.analyze_face()
+        elif action == "objects":
+            result = camera_engine.detect_objects()
+        elif action == "identify":
+            result = camera_engine.identify_face()
+        else:
+            result = "Unknown camera action."
+        self.root.after(0, lambda: self._append_message("assistant", result))
+        speak(result, self)
 
     def toggle_online_mode(self):
         global _offline_mode
@@ -2634,27 +3178,27 @@ class AssistantApp:
     def toggle_tts(self):
         self.tts_muted = not self.tts_muted
         if self.tts_muted:
-            self.mute_btn.config(text="🔇 Voice: OFF", bg="#222235", fg="#ff5555")
+            self.mute_btn.config(text="🔇 Muted", bg="#222235", fg="#ff5555")
             mute_jarvis_instantly()
         else:
             _tts_stop_event.clear()
-            self.mute_btn.config(text="🔊 Voice: ON", bg="#1e1e30", fg="#5ce1e6")
+            self.mute_btn.config(text="🔊 Voice", bg="#1e1e30", fg="#5ce1e6")
 
     def toggle_voice_mode(self):
         _modes = ["off", "auto", "ptt"]
         self.mic_mode = _modes[(_modes.index(self.mic_mode) + 1) % len(_modes)]
         self.voice_mode = (self.mic_mode == "auto")
         if self.mic_mode == "off":
-            self.mic_btn.config(text="🎤 Mic: OFF", bg="#222235", fg="#9a9ab0")
+            self.mic_btn.config(text="🎤 Off", bg="#222235", fg="#9a9ab0")
             self.ptt_btn.pack_forget()
             self.status_var.set("System Active")
         elif self.mic_mode == "auto":
-            self.mic_btn.config(text="🎤 Mic: ON", bg="#ff5555", fg="#ffffff")
+            self.mic_btn.config(text="🎤 Live", bg="#ff5555", fg="#ffffff")
             self.ptt_btn.pack_forget()
             self.status_var.set("🎤 Listening — speak anytime")
             threading.Thread(target=self.listen_to_schmit, daemon=True).start()
         elif self.mic_mode == "ptt":
-            self.mic_btn.config(text="🎤 Push-to-Talk", bg="#7d47b2", fg="#ffffff")
+            self.mic_btn.config(text="🎤 PTT", bg="#7d47b2", fg="#ffffff")
             self.ptt_btn.pack(fill=tk.X, pady=(4, 0))
             self.status_var.set("🎙 Push-to-Talk active — hold button to speak")
 
