@@ -26,6 +26,10 @@ pip install ^
     pyaudio ^
     pycaw ^
     comtypes ^
+    opencv-python ^
+    deepface ^
+    tf-keras ^
+    ultralytics ^
     --quiet
 
 if errorlevel 1 (
@@ -42,7 +46,6 @@ echo      Press Ctrl+Shift+Space to toggle the popup.
 echo      Close this window to stop the assistant.
 echo.
 
-REM Change to the directory this .bat file lives in (works on any machine)
 cd /d "%~dp0"
 
 python assistant.py
