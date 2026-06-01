@@ -37,7 +37,8 @@ pip install ^
     sounddevice ^
     pyaudio ^
     pycaw ^
-    comtypes
+    comtypes ^
+    chromadb
 
 if errorlevel 1 (
     echo.
@@ -81,7 +82,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$pp=(pip --version 2>&1); Log ('  pip        : '+$pp);" ^
     "Log '';" ^
     "Log '--- 3. PACKAGES -----------------------------------------------';" ^
-    "foreach ($p in @('faster-whisper','numpy','requests','keyboard','psutil','pystray','Pillow','kokoro','sounddevice','pyaudio','pycaw','comtypes','torch','huggingface-hub')) {" ^
+    "foreach ($p in @('faster-whisper','numpy','requests','keyboard','psutil','pystray','Pillow','kokoro','sounddevice','pyaudio','pycaw','comtypes','chromadb','torch','huggingface-hub')) {" ^
     "  $raw=(pip show $p 2>$null | Where-Object { $_ -like 'Version:*' } | Select-Object -First 1);" ^
     "  if ($raw) { Log ('  [OK]  '+$p.PadRight(18)+'  v'+($raw -replace 'Version:\s*','')) }" ^
     "  else { Log ('  [!!]  '+$p.PadRight(18)+'  NOT INSTALLED  -->  pip install '+$p) }" ^
