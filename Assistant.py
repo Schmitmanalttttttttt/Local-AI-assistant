@@ -36,6 +36,7 @@ _REQUIRED_PACKAGES = [
     ("deepface",         "deepface"),
     ("tf-keras",         "tf_keras"),
     ("ultralytics",      "ultralytics"),
+    ("chromadb",         "chromadb"),
 ]
 
 # Packages that trigger heavy side-effects on import (TF loading, etc.)
@@ -79,6 +80,8 @@ def _bootstrap():
     sys.exit(0)
 
 _bootstrap()
+import time as _time
+_BOOT_START = _time.perf_counter()
 # ─────────────────────────────────────────────────────────────────────────────
 
 import json
@@ -92,6 +95,8 @@ import logging
 import warnings
 import ctypes
 import base64
+import sqlite3
+import uuid
 from io import BytesIO
 import numpy as np
 
@@ -142,6 +147,8 @@ _tts_queue: queue.Queue = queue.Queue()
 _tts_pipeline = None
 _tts_thread = None
 _tts_stop_event = threading.Event()  # set to interrupt current playback on mute
+_inference_stop = threading.Event()   # set to cancel current model request
+_inference_response = None            # active streaming response; close() to abort immediately
 
 _KOKORO_VOICES = {
     "British Male — George (Default)": "bm_george",
@@ -240,12 +247,11 @@ except ImportError:
 
 # -- Config -----------------------------------------------------------------
 CONFIG_FILE = Path.home() / ".ai_assistant_config.json"
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
 CHAT_MODEL   = "llama3.2:3b"     # fast tier — simple chat and greetings
 OLLAMA_MODEL = "qwen3:4b"        # main tier — commands and normal queries
-REASON_MODEL = "deepseek-r1:8b"  # deep tier — complex multi-step reasoning
+REASON_MODEL = "deepseek-r1:8b"  # deep tier — complex multi-step reasoning (override below if ultra-deep enabled)
 EMBED_MODEL  = "nomic-embed-text"
+ULTRA_DEEP_THINKING_MODEL = "llama3.1:70b"  # ultra tier — requires ~64GB RAM
 
 _active_model = OLLAMA_MODEL  # tracks which model handled the last request
 
@@ -328,15 +334,23 @@ def load_config():
             cfg = json.load(f)
         cfg.pop("openai_api_key", None)
         return cfg
-    return {"watched_folder": "", "hotkey": "ctrl+shift+space"}
+    return {"watched_folder": "", "hotkey": "ctrl+shift+space", "ollama_host": "localhost", "ollama_hosts": ["localhost"]}
 
 def save_config(cfg):
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
 config = load_config()
+_ollama_host = config.get("ollama_host", "localhost")
+OLLAMA_URL = f"http://{_ollama_host}:11434/api/chat"
+OLLAMA_EMBED_URL = f"http://{_ollama_host}:11434/api/embeddings"
 _tts_voice = config.get("tts_voice", "bm_george")
 CHAT_MEMORY = []
+_SESSION_ID = str(uuid.uuid4())  # unique ID for this app launch
+
+# Apply ultra-deep thinking model if enabled
+if config.get("ultra_deep_thinking", False):
+    REASON_MODEL = ULTRA_DEEP_THINKING_MODEL
 
 # Always use system default — clear any previously saved override
 _sound_device_idx = None
@@ -455,6 +469,7 @@ EXPLICIT_MEMORY_FILE = MEMORY_DIR / "explicit_memory.json"
 PLAYBOOK_FILE        = MEMORY_DIR / "playbooks.json"
 SCHEDULED_FILE       = MEMORY_DIR / "scheduled_tasks.json"
 SCRIPTS_FILE         = MEMORY_DIR / "scripts.json"
+CHAT_HISTORY_DB      = MEMORY_DIR / "chat_history.db"
 SCRIPTS_DIR          = Path(__file__).parent / "scripts"
 SCRIPTS_DIR.mkdir(exist_ok=True)
 KNOWN_FACES_DIR      = MEMORY_DIR / "known_faces"
@@ -462,7 +477,192 @@ KNOWN_FACES_DIR.mkdir(exist_ok=True)
 LAST_INTERACTION: dict = {"text": "", "raw": ""}
 _offline_mode: bool = False
 _ui_app = None          # set after AssistantApp is constructed
+
+# -- Chat History (SQLite) ---------------------------------------------------
+class ChatHistoryDB:
+    """Persistent, session-aware chat log with semantic retrieval.
+
+    Storage: one SQLite file in memory/.
+    Retrieval: cosine similarity over float32 embedding BLOBs — no extra deps.
+    Save: background thread so it never blocks the UI.
+    """
+
+    def __init__(self, db_path: Path):
+        self._path = str(db_path)
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _conn(self):
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _init_db(self):
+        with self._lock, self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id  TEXT    NOT NULL,
+                    role        TEXT    NOT NULL,
+                    content     TEXT    NOT NULL,
+                    timestamp   REAL    NOT NULL,
+                    embedding   BLOB
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_session   ON chat_history(session_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_history(timestamp)")
+
+    def save_exchange(self, user_text: str, assistant_text: str, user_emb: list):
+        """Save a Q+A pair. Embedding is stored for the combined pair (better recall)."""
+        combined = f"user: {user_text[:300]}\nassistant: {assistant_text[:300]}"
+        emb_blob = None
+        if user_emb:
+            emb_blob = np.array(user_emb, dtype=np.float32).tobytes()
+
+        now = time.time()
+        def _write():
+            with self._lock, self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO chat_history(session_id,role,content,timestamp,embedding) VALUES(?,?,?,?,?)",
+                    (_SESSION_ID, "user", user_text[:2000], now, emb_blob)
+                )
+                conn.execute(
+                    "INSERT INTO chat_history(session_id,role,content,timestamp,embedding) VALUES(?,?,?,?,?)",
+                    (_SESSION_ID, "assistant", assistant_text[:2000], now + 0.001, None)
+                )
+        threading.Thread(target=_write, daemon=True).start()
+
+    def get_relevant_history(self, query_emb: list, top_k: int = 3,
+                             exclude_session: str = None) -> str:
+        """Return top-K semantically relevant past exchanges as a context string."""
+        if not query_emb:
+            return ""
+        try:
+            q_vec = np.array(query_emb, dtype=np.float32)
+            q_norm = np.linalg.norm(q_vec)
+            if q_norm == 0:
+                return ""
+
+            with self._lock, self._conn() as conn:
+                # Only fetch rows that have embeddings (user turns)
+                rows = conn.execute(
+                    "SELECT id, content, timestamp, embedding FROM chat_history "
+                    "WHERE role='user' AND embedding IS NOT NULL "
+                    "ORDER BY timestamp DESC LIMIT 500"
+                ).fetchall()
+
+            if not rows:
+                return ""
+
+            scored = []
+            for row_id, content, ts, blob in rows:
+                vec = np.frombuffer(blob, dtype=np.float32)
+                norm = np.linalg.norm(vec)
+                if norm == 0:
+                    continue
+                sim = float(np.dot(q_vec, vec) / (q_norm * norm))
+                if sim > 0.30:
+                    scored.append((sim, ts, row_id, content))
+
+            if not scored:
+                return ""
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top = scored[:top_k]
+
+            # For each matched user turn, fetch the assistant reply that follows it
+            lines = ["Relevant past conversations:"]
+            with self._lock, self._conn() as conn:
+                for _, ts, row_id, user_content in top:
+                    reply_row = conn.execute(
+                        "SELECT content FROM chat_history WHERE role='assistant' "
+                        "AND timestamp > ? ORDER BY timestamp ASC LIMIT 1",
+                        (ts,)
+                    ).fetchone()
+                    reply = reply_row[0][:300] if reply_row else "(no reply)"
+                    lines.append(f"  Q: {user_content[:200]}")
+                    lines.append(f"  A: {reply}")
+
+            result = "\n".join(lines)
+            # Hard cap at 3,200 chars so it never floods the prompt
+            return result[:3200]
+        except Exception:
+            return ""
+
+    def get_sessions(self) -> list:
+        """Return list of (session_id, first_timestamp, message_count) for UI browsing."""
+        try:
+            with self._lock, self._conn() as conn:
+                return conn.execute(
+                    "SELECT session_id, MIN(timestamp), COUNT(*) FROM chat_history "
+                    "GROUP BY session_id ORDER BY MIN(timestamp) DESC LIMIT 100"
+                ).fetchall()
+        except Exception:
+            return []
+
+    def get_session_messages(self, session_id: str) -> list:
+        """Return all (role, content, timestamp) rows for a session."""
+        try:
+            with self._lock, self._conn() as conn:
+                return conn.execute(
+                    "SELECT role, content, timestamp FROM chat_history "
+                    "WHERE session_id=? ORDER BY timestamp ASC",
+                    (session_id,)
+                ).fetchall()
+        except Exception:
+            return []
+
+    def reset(self):
+        """Wipe all stored history. Opens and explicitly closes a connection so no lock lingers."""
+        with self._lock:
+            conn = self._conn()
+            try:
+                conn.execute("DELETE FROM chat_history")
+                conn.commit()
+                conn.execute("VACUUM")
+                conn.commit()
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+chat_db = ChatHistoryDB(CHAT_HISTORY_DB)
 _memory_warned = False  # show the memory-size warning at most once per session
+
+def _wipe_all_memory():
+    """Delete all persistent memory without touching the directory itself.
+    Avoids Windows file-lock issues that shutil.rmtree triggers on open SQLite files."""
+    global CHAT_MEMORY, _memory_warned
+    # 1. Clear the SQLite chat history (connection is explicitly closed inside reset())
+    try:
+        chat_db.reset()
+    except Exception:
+        pass
+    # 2. Delete individual memory files (leaves the directory intact)
+    for f in [EXPLICIT_MEMORY_FILE, FEEDBACK_FILE, FEEDBACK_LOG, PLAYBOOK_FILE,
+              SCHEDULED_FILE, SCRIPTS_FILE]:
+        try:
+            if f.exists():
+                f.unlink()
+        except Exception:
+            pass
+    # 3. Wipe chroma_db sub-folder if present
+    chroma_dir = MEMORY_DIR / "chroma_db"
+    if chroma_dir.exists():
+        try:
+            shutil.rmtree(chroma_dir)
+        except Exception:
+            pass
+    # 4. Wipe known faces
+    if KNOWN_FACES_DIR.exists():
+        try:
+            shutil.rmtree(KNOWN_FACES_DIR)
+        except Exception:
+            pass
+    KNOWN_FACES_DIR.mkdir(exist_ok=True)
+    # 5. Reset in-memory state
+    CHAT_MEMORY = []
+    _memory_warned = False
 
 _POSITIVE = {
     # Direct praise
@@ -1679,6 +1879,25 @@ def fetch_url(url: str) -> str:
         return f"❌ Could not fetch URL: {e}"
 
 # -- Camera Engine (Vision / Face / Object Recognition) ---------------------
+
+# Lazy-load DeepFace on first use (heavy library with pre-trained models)
+_deepface_module = None
+
+def _get_deepface():
+    global _deepface_module
+    if _deepface_module is None:
+        print("[DeepFace] Loading face recognition models (first run ~1-2 min, then cached)...")
+        import sys as _sys, io as _io
+        _old_err = _sys.stderr
+        _sys.stderr = _io.StringIO()
+        try:
+            import deepface.DeepFace as _df
+            _deepface_module = _df
+        finally:
+            _sys.stderr = _old_err
+        print("[DeepFace] ✅ Models loaded.")
+    return _deepface_module
+
 class CameraEngine:
     """Manages webcam capture, YOLO object detection, DeepFace analysis, and known-face recognition."""
     YOLO_MODEL = "yolov8n.pt"   # nano — fastest, ~6 MB download on first use
@@ -1881,12 +2100,7 @@ class CameraEngine:
         if frame is None:
             return "❌ Camera not started."
         try:
-            import sys as _sys, io as _io
-            _old_err = _sys.stderr; _sys.stderr = _io.StringIO()
-            try:
-                import deepface.DeepFace as DeepFace
-            finally:
-                _sys.stderr = _old_err
+            DeepFace = _get_deepface()
             result = DeepFace.analyze(frame, actions=["emotion", "age", "gender"],
                                       enforce_detection=False, silent=True)
             if isinstance(result, list):
@@ -1941,12 +2155,7 @@ class CameraEngine:
         if not subdirs:
             return "❌ No saved faces yet. Say 'remember my face as [name]' to train me."
         try:
-            import sys as _sys, io as _io
-            _old_err = _sys.stderr; _sys.stderr = _io.StringIO()
-            try:
-                import deepface.DeepFace as DeepFace
-            finally:
-                _sys.stderr = _old_err
+            DeepFace = _get_deepface()
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 tmp_path = tmp.name
             cv2.imwrite(tmp_path, frame)
@@ -2008,7 +2217,7 @@ def _screenshot_b64() -> str:
 
 def _detect_vision_model() -> str:
     try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=3)
+        r = requests.get(f"http://{_ollama_host}:11434/api/tags", timeout=3)
         for m in r.json().get("models", []):
             name = m.get("name", "")
             if any(vm in name for vm in ("llava", "moondream", "minicpm", "bakllava")):
@@ -2285,7 +2494,7 @@ Never respond with plain text. Never omit the "action" key.
         payload = {
             "model": model,
             "messages": messages,
-            "stream": False,
+            "stream": True,
             "options": {
                 "format": "json",
                 "temperature": 0.0,
@@ -2293,10 +2502,28 @@ Never respond with plain text. Never omit the "action" key.
             },
         }
         def _call(mdl, timeout_s):
+            global _inference_response
             payload["model"] = mdl
-            r = requests.post(OLLAMA_URL, json=payload, timeout=timeout_s)
+            r = requests.post(OLLAMA_URL, json=payload, timeout=timeout_s, stream=True)
             r.raise_for_status()
-            return r.json()
+            _inference_response = r
+            try:
+                chunks = []
+                for raw_line in r.iter_lines():
+                    if _inference_stop.is_set():
+                        r.close()
+                        return None  # cancelled
+                    if not raw_line:
+                        continue
+                    chunk = json.loads(raw_line)
+                    delta = chunk.get("message", {}).get("content", "")
+                    if delta:
+                        chunks.append(delta)
+                    if chunk.get("done"):
+                        break
+                return {"message": {"content": "".join(chunks)}}
+            finally:
+                _inference_response = None
 
         data = None
         fallback_notice = ""
@@ -2315,6 +2542,9 @@ Never respond with plain text. Never omit the "action" key.
                     return f'{{"action": "chat", "args": {{"message": "❌ Both models timed out. Try a shorter request."}}}}'
             else:
                 return f'{{"action": "chat", "args": {{"message": "❌ Model timed out. Ollama may be busy — please try again."}}}}'
+
+        if data is None:
+            return f'{{"action": "chat", "args": {{"message": "⏹ Request cancelled."}}}}'
 
         if "message" in data:
             content = data["message"]["content"].strip()
@@ -2338,14 +2568,8 @@ def process_message(text: str) -> str:
 
     context = file_engine.get_folder_summary()
 
-    # Only compute an embedding when there is saved data worth searching.
-    # This avoids an Ollama round-trip on every message when the data stores are empty.
-    _has_data = (
-        EXPLICIT_MEMORY_FILE.exists()
-        or PLAYBOOK_FILE.exists()
-        or (FEEDBACK_FILE.exists() and FEEDBACK_FILE.stat().st_size > 50)
-    )
-    _query_emb = get_embedding(text) if _has_data else None
+    # Always embed the query — needed for chat history retrieval + existing memory search
+    _query_emb = get_embedding(text)
 
     # Inject semantically relevant explicit memories
     memories = get_relevant_memories(text, emb=_query_emb)
@@ -2357,10 +2581,15 @@ def process_message(text: str) -> str:
     if playbooks:
         context += "\n\n" + playbooks
 
-    # Inject learned patterns from past good interactions (semantic search if embeddings available)
+    # Inject learned patterns from past good interactions
     learned = get_learned_context(text, emb=_query_emb)
     if learned:
         context += "\n\n" + learned
+
+    # Inject semantically relevant past chat history (top-3, capped at 3,200 chars)
+    past = chat_db.get_relevant_history(_query_emb)
+    if past:
+        context += "\n\n" + past
 
     # Warn once per session when accumulated memory is getting large
     global _memory_warned
@@ -2765,6 +2994,9 @@ def process_message(text: str) -> str:
     LAST_INTERACTION["text"] = text
     LAST_INTERACTION["raw"] = raw
 
+    # Persist exchange to chat history DB (background thread — never blocks UI)
+    chat_db.save_exchange(text, final_output, _query_emb)
+
     return final_output
 
 # -- Custom Tkinter Interface ------------------------------------------------
@@ -2772,6 +3004,8 @@ class AssistantApp:
     def __init__(self):
         self.root = None
         self.visible = False
+        self._busy = False
+        self._msg_queue: list[str] = []
         self._build_window()
         self._apply_startup_defaults()
     def _build_window(self):
@@ -2803,14 +3037,22 @@ class AssistantApp:
         self.chat.tag_config("assistant", foreground="#e1e1ea")
         self.chat.tag_config("system", foreground="#5c5c70", font=("Consolas", 10, "italic"))
         self.chat.tag_config("thought", foreground="#7060a8", font=("Consolas", 10, "italic"))
-        input_container = tk.Frame(self.main_frame, bg="#0f0f16")
+        # Queue strip — hidden when empty, shows pending messages as pill chips
+        self.queue_strip = tk.Frame(self.main_frame, bg="#0f0f16")
+        self._queue_label = tk.Label(self.queue_strip, text="Queued:", font=("Segoe UI", 8), fg="#5c5c80", bg="#0f0f16")
+        self._queue_label.pack(side=tk.LEFT, padx=(16, 6))
+        self._queue_chips_frame = tk.Frame(self.queue_strip, bg="#0f0f16")
+        self._queue_chips_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # queue_strip is NOT packed here — it appears via _refresh_queue_strip when needed
+        self.input_container = tk.Frame(self.main_frame, bg="#0f0f16")
+        input_container = self.input_container
         input_container.pack(fill=tk.X, padx=16, pady=(12, 12))
         self.input_var = tk.StringVar()
         self.entry = tk.Entry(input_container, textvariable=self.input_var, font=("Segoe UI", 11), bg="#06060a", fg="#ffffff", insertbackground="#5c5cff", relief=tk.FLAT, highlightthickness=1, highlightbackground="#1c1c28")
         self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=10, padx=(0, 10))
         self.entry.bind("<Return>", self.send)
         self.entry.bind("<Escape>", lambda e: self.hide())
-        self.send_btn = tk.Button(input_container, text="Execute", font=("Segoe UI Semibold", 10), bg="#4747b2", fg="#ffffff", relief=tk.FLAT, cursor="hand2", padx=20, pady=8, command=self.send)
+        self.send_btn = tk.Button(input_container, text="Send", font=("Segoe UI Semibold", 10), bg="#4747b2", fg="#ffffff", relief=tk.FLAT, cursor="hand2", padx=20, pady=8, command=self.send)
         self.send_btn.pack(side=tk.RIGHT)
         # -- Speech Framework Toggle Variable Configurations --
         self.mic_mode = "off"   # "off" | "auto" | "ptt"
@@ -2904,25 +3146,17 @@ class AssistantApp:
         btn_row.pack(pady=22)
 
         def do_delete():
-            global CHAT_MEMORY, _memory_warned
-            # Wipe all persistent memory stores
-            for path in (EXPLICIT_MEMORY_FILE, PLAYBOOK_FILE):
-                try:
-                    path.write_text("[]")
-                except Exception:
-                    pass
+            global CHAT_MEMORY, _memory_warned, _deepface_module
+            _wipe_all_memory()
+            # Clear DeepFace cache from memory if loaded
             try:
-                feedback = load_feedback()
-                feedback["interactions"] = []
-                with open(FEEDBACK_FILE, "w") as f:
-                    json.dump(feedback, f, indent=2)
+                if _deepface_module is not None and hasattr(_deepface_module, 'representation_cache'):
+                    _deepface_module.representation_cache.clear()
             except Exception:
                 pass
-            CHAT_MEMORY = []
-            _memory_warned = False  # allow re-warning if it fills up again
+            _deepface_module = None
             win.destroy()
-            self._append_message("system",
-                "🗑️ Memory cleared — Jarvis is running clean again.")
+            self._append_message("system", "🗑️ All memory cleared.")
 
         def do_keep():
             win.destroy()
@@ -3095,13 +3329,16 @@ class AssistantApp:
             self._append_message("system", "🌐 Online mode — 🔍 button now searches the web.")
 
     def web_search_send(self):
+        if self._busy:
+            return
         text = self.input_var.get().strip()
         if not text:
             hint = "💡 Type a filename or keyword, then click 🔍 to search your PC." if _offline_mode else "💡 Type something in the box first, then click 🔍 to search."
             self._append_message("system", hint)
             return
         self.input_var.set("")
-        self.send_btn.config(state=tk.DISABLED)
+        self._busy = True
+        self.send_btn.config(text="Stop", bg="#aa2222", fg="#ffffff", command=self._cancel_request)
         self.websearch_btn.config(state=tk.DISABLED)
 
         if _offline_mode:
@@ -3129,21 +3366,34 @@ class AssistantApp:
 
     def _on_web_search_response(self, text: str):
         self._append_message("assistant", text)
-        self.status_var.set("System Active")
-        self.send_btn.config(state=tk.NORMAL)
         self.websearch_btn.config(state=tk.NORMAL)
         self.entry.focus()
+        self._busy = False
+        self.send_btn.config(text="Send", bg="#4747b2", fg="#ffffff", command=self.send)
+        if self._msg_queue:
+            next_msg = self._msg_queue.pop(0)
+            self._refresh_queue_strip()
+            self._start_request(next_msg)
+        else:
+            self.status_var.set("System Active")
 
     def send(self, event=None):
-        if self.send_btn['state'] == tk.DISABLED:
-            return  # already processing — ignore duplicate Enter/click
         text = self.input_var.get().strip()
         if not text:
             return
         self.input_var.set("")
+        if self._busy:
+            self._msg_queue.append(text)
+            self._refresh_queue_strip()
+            return
+        self._start_request(text)
+
+    def _start_request(self, text: str):
+        self._busy = True
+        _inference_stop.clear()
         self._append_message("user", text)
         self.status_var.set("Analyzing execution vectors...")
-        self.send_btn.config(state=tk.DISABLED)
+        self.send_btn.config(text="Stop", bg="#aa2222", fg="#ffffff", command=self._cancel_request)
 
         def run():
             response = process_message(text)
@@ -3151,16 +3401,54 @@ class AssistantApp:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _cancel_request(self):
+        global _inference_response
+        _inference_stop.set()
+        if _inference_response is not None:
+            try:
+                _inference_response.close()
+            except Exception:
+                pass
+        self.status_var.set("Cancelling...")
+
+    def _refresh_queue_strip(self):
+        for w in self._queue_chips_frame.winfo_children():
+            w.destroy()
+        if not self._msg_queue:
+            self.queue_strip.pack_forget()
+            return
+        self.queue_strip.pack(fill=tk.X, padx=16, pady=(4, 0), before=self.input_container)
+        for idx, msg in enumerate(self._msg_queue):
+            i = idx
+            chip = tk.Frame(self._queue_chips_frame, bg="#1c1c30", padx=0, pady=0)
+            chip.pack(side=tk.LEFT, padx=(0, 4), pady=2)
+            label_text = msg if len(msg) <= 28 else msg[:25] + "..."
+            tk.Label(chip, text=label_text, font=("Segoe UI", 8), fg="#9090c0", bg="#1c1c30", padx=6, pady=2).pack(side=tk.LEFT)
+            tk.Button(chip, text="×", font=("Segoe UI", 8, "bold"), fg="#666680", bg="#1c1c30",
+                      bd=0, cursor="hand2", padx=4, pady=2,
+                      command=lambda x=i: self._remove_queued(x)).pack(side=tk.LEFT, padx=(0, 3))
+
+    def _remove_queued(self, idx: int):
+        if 0 <= idx < len(self._msg_queue):
+            self._msg_queue.pop(idx)
+            self._refresh_queue_strip()
+
     def _on_response(self, text: str):
         self._append_message("assistant", text)
-        self.status_var.set("System Active")
-        self.send_btn.config(state=tk.NORMAL)
         self.model_label.config(text=f"🤖 {_active_model}")
         speak(text, self)
         self.entry.focus()
+        self._busy = False
+        self.send_btn.config(text="Send", bg="#4747b2", fg="#ffffff", command=self.send)
+        if self._msg_queue:
+            next_msg = self._msg_queue.pop(0)
+            self._refresh_queue_strip()
+            self._start_request(next_msg)
+        else:
+            self.status_var.set("System Active")
 
     def _give_feedback(self, rating: int):
-        save_feedback_entry(rating)
+        threading.Thread(target=save_feedback_entry, args=(rating,), daemon=True).start()
         if rating > 0:
             icon = "👍"
             desc = {5: "Perfect", 4: "Great", 3: "Good", 2: "Okay", 1: "Passable"}.get(rating, "Positive")
@@ -3390,9 +3678,8 @@ class AssistantApp:
     def open_settings(self):
         win = tk.Toplevel(self.root)
         win.title("Global Settings")
-        win.geometry("500x370")
         win.configure(bg="#0f0f16")
-        win.resizable(False, False)
+        win.resizable(True, True)
         win.grab_set()
 
         main_layer = tk.Frame(win, bg="#0f0f16", bd=1, highlightbackground="#222235", highlightthickness=1)
@@ -3456,47 +3743,260 @@ class AssistantApp:
         ).grid(row=3, column=1, padx=6, pady=10, sticky="w")
 
         # ── Row 4: Clear Memory ────────────────────────────────────────────────
-        _lbl(4, "Feedback memory:")
+        _lbl(4, "Memory:")
 
         def clear_memory():
             if not messagebox.askyesno(
                 "Clear Memory",
-                "Are you sure?\n\nThis will permanently delete all thumbs-up/down feedback the assistant has learned from.",
+                "Are you sure?\n\nThis will permanently delete all stored assistant memory and learned data.",
                 icon="warning", parent=win
             ):
                 return
-            for path in (FEEDBACK_FILE, FEEDBACK_LOG):
-                try:
-                    if path.exists():
-                        path.unlink()
-                except Exception:
-                    pass
-            self._append_message("system", "🗑️ Feedback memory cleared.")
+            _wipe_all_memory()
+            self._append_message("system", "🗑️ All memory cleared.")
 
         tk.Button(
-            main_layer, text="🗑️ Clear Feedback Memory",
+            main_layer, text="🗑️ Clear All Memory",
             font=("Segoe UI", 9), bg="#3a1a1a", fg="#ff7777",
             relief=tk.FLAT, cursor="hand2", padx=10, pady=4,
             command=clear_memory
         ).grid(row=4, column=1, padx=6, pady=10, sticky="w")
 
+        # ── Row 5: Ultra Deep Thinking ─────────────────────────────────────────
+        _lbl(5, "AI Model Tier:")
+        
+        def configure_ultra_deep():
+            ultra_win = tk.Toplevel(win)
+            ultra_win.title("Ultra Deep Thinking Configuration")
+            ultra_win.geometry("450x280")
+            ultra_win.configure(bg="#0f0f16")
+            ultra_win.resizable(False, False)
+            ultra_win.grab_set()
+            
+            content = tk.Frame(ultra_win, bg="#0f0f16")
+            content.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+            
+            title_lbl = tk.Label(content, text="🧠 Ultra Deep Thinking Model", 
+                                font=("Segoe UI", 12, "bold"), fg="#ffffff", bg="#0f0f16")
+            title_lbl.pack(pady=(0, 12))
+            
+            model_frame = tk.Frame(content, bg="#1a1a2e", relief=tk.FLAT, bd=1, highlightbackground="#222235", highlightthickness=1)
+            model_frame.pack(fill=tk.X, pady=8)
+            
+            tk.Label(model_frame, text="Model:", font=("Segoe UI", 10, "bold"), fg="#9a9ab0", bg="#1a1a2e").pack(anchor="w", padx=10, pady=6)
+            tk.Label(model_frame, text="llama3.1:70b", font=("Consolas", 10), fg="#5cff5c", bg="#1a1a2e").pack(anchor="w", padx=20, pady=(0, 6))
+            
+            req_frame = tk.Frame(content, bg="#1a1a2e", relief=tk.FLAT, bd=1, highlightbackground="#222235", highlightthickness=1)
+            req_frame.pack(fill=tk.X, pady=8)
+            
+            tk.Label(req_frame, text="⚠️  System Requirements:", font=("Segoe UI", 10, "bold"), fg="#ffaa00", bg="#1a1a2e").pack(anchor="w", padx=10, pady=(6, 0))
+            tk.Label(req_frame, text="• RAM: ~64 GB minimum", font=("Segoe UI", 9), fg="#c8c8e0", bg="#1a1a2e").pack(anchor="w", padx=20, pady=2)
+            tk.Label(req_frame, text="• Disk: ~50 GB for model download", font=("Segoe UI", 9), fg="#c8c8e0", bg="#1a1a2e").pack(anchor="w", padx=20, pady=2)
+            tk.Label(req_frame, text="• Will require application restart", font=("Segoe UI", 9), fg="#c8c8e0", bg="#1a1a2e").pack(anchor="w", padx=20, pady=(2, 6))
+            
+            btn_frame = tk.Frame(content, bg="#0f0f16")
+            btn_frame.pack(fill=tk.X, pady=12)
+            
+            current_enabled = config.get("ultra_deep_thinking", False)
+            
+            def enable_ultra_deep():
+                config["ultra_deep_thinking"] = True
+                save_config(config)
+                ultra_win.destroy()
+                messagebox.showinfo(
+                    "Restart Required",
+                    "Ultra Deep Thinking enabled!\n\n"
+                    "Please restart the application to apply this change and start using llama3.1:70b for complex reasoning tasks.\n\n"
+                    "Make sure your system has at least 64GB of available RAM.",
+                    parent=win
+                )
+            
+            def disable_ultra_deep():
+                config["ultra_deep_thinking"] = False
+                save_config(config)
+                ultra_win.destroy()
+                messagebox.showinfo(
+                    "Ultra Deep Thinking Disabled",
+                    "Ultra Deep Thinking has been disabled.\n\n"
+                    "Complex reasoning will use the default deepseek-r1:8b model on restart.",
+                    parent=win
+                )
+            
+            if current_enabled:
+                tk.Button(btn_frame, text="✓ Ultra Deep Thinking: ON",
+                         font=("Segoe UI", 10, "bold"), bg="#1a5a1a", fg="#5cff5c",
+                         relief=tk.FLAT, cursor="hand2", padx=12, pady=6,
+                         command=disable_ultra_deep).pack(side=tk.LEFT, padx=4)
+            else:
+                tk.Button(btn_frame, text="Enable Ultra Deep Thinking",
+                         font=("Segoe UI", 10), bg="#3a2a1a", fg="#ffaa00",
+                         relief=tk.FLAT, cursor="hand2", padx=12, pady=6,
+                         command=enable_ultra_deep).pack(side=tk.LEFT, padx=4)
+            
+            tk.Button(btn_frame, text="Close",
+                     font=("Segoe UI", 9), bg="#222235", fg="#9a9ab0",
+                     relief=tk.FLAT, cursor="hand2", padx=12, pady=6,
+                     command=ultra_win.destroy).pack(side=tk.LEFT, padx=4)
+        
+        ultra_status = config.get("ultra_deep_thinking", False)
+        ultra_text = "🧠 Ultra Deep (llama3.1:70b)" if ultra_status else "Standard (deepseek-r1:8b)"
+        tk.Button(
+            main_layer, text=ultra_text,
+            font=("Segoe UI", 9), bg="#2a3a4a" if ultra_status else "#1a2a3a", fg="#5cff5c" if ultra_status else "#9a9ab0",
+            relief=tk.FLAT, cursor="hand2", padx=10, pady=4,
+            command=configure_ultra_deep
+        ).grid(row=5, column=1, padx=6, pady=10, sticky="w")
+
+        # ── Row 6: Ollama Hosts ────────────────────────────────────────────────
+        tk.Label(main_layer, text="Ollama Hosts:", font=("Segoe UI", 10),
+                 fg="#9a9ab0", bg="#0f0f16"
+                 ).grid(row=6, column=0, padx=16, pady=(10, 0), sticky="ne")
+
+        hosts_panel = tk.Frame(main_layer, bg="#0f0f16")
+        hosts_panel.grid(row=6, column=1, padx=6, pady=(8, 4), sticky="ew")
+
+        lb_wrap = tk.Frame(hosts_panel, bg="#0f0f16")
+        lb_wrap.pack(fill=tk.X)
+
+        hosts_lb = tk.Listbox(lb_wrap, font=("Consolas", 10), bg="#06060a", fg="#d1d1e0",
+                              selectbackground="#222235", selectforeground="#5ce1e6",
+                              relief=tk.FLAT, highlightbackground="#1c1c28", highlightthickness=1,
+                              height=4, width=34)
+        hosts_lb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        _lb_sb = tk.Scrollbar(lb_wrap, orient=tk.VERTICAL, command=hosts_lb.yview)
+        _lb_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        hosts_lb.config(yscrollcommand=_lb_sb.set)
+
+        _all_hosts = list(config.get("ollama_hosts", [config.get("ollama_host", "localhost")]))
+
+        def _refresh_lb():
+            hosts_lb.delete(0, tk.END)
+            active = config.get("ollama_host", "localhost")
+            for h in _all_hosts:
+                label = f"  [ACTIVE]  {h}" if h == active else f"           {h}"
+                hosts_lb.insert(tk.END, label)
+
+        _refresh_lb()
+
+        action_row = tk.Frame(hosts_panel, bg="#0f0f16")
+        action_row.pack(fill=tk.X, pady=(4, 0))
+
+        def _set_active():
+            sel = hosts_lb.curselection()
+            if not sel:
+                return
+            config["ollama_host"] = _all_hosts[sel[0]]
+            _refresh_lb()
+            conn_lbl.config(text=f"Active: {config['ollama_host']} — press Save to apply.", fg="#5ce1e6")
+
+        def _remove_host():
+            sel = hosts_lb.curselection()
+            if not sel or len(_all_hosts) <= 1:
+                return
+            idx = sel[0]
+            removed = _all_hosts.pop(idx)
+            if removed == config.get("ollama_host", "localhost"):
+                config["ollama_host"] = _all_hosts[0]
+            _refresh_lb()
+
+        tk.Button(action_row, text="Set Active", font=("Segoe UI", 9),
+                  bg="#1a2a4a", fg="#5c9aff", relief=tk.FLAT, cursor="hand2",
+                  padx=6, pady=3, command=_set_active).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(action_row, text="Remove", font=("Segoe UI", 9),
+                  bg="#3a1a1a", fg="#ff7777", relief=tk.FLAT, cursor="hand2",
+                  padx=6, pady=3, command=_remove_host).pack(side=tk.LEFT)
+
+        add_row = tk.Frame(hosts_panel, bg="#0f0f16")
+        add_row.pack(fill=tk.X, pady=(6, 0))
+
+        new_host_var = tk.StringVar()
+        new_host_entry = tk.Entry(add_row, textvariable=new_host_var, font=("Consolas", 10),
+                                  bg="#06060a", fg="#ffffff", insertbackground="#5c5cff",
+                                  relief=tk.FLAT, width=18, highlightbackground="#1c1c28",
+                                  highlightthickness=1)
+        new_host_entry.pack(side=tk.LEFT, ipady=4, padx=(0, 4))
+
+        def _add_host(event=None):
+            h = new_host_var.get().strip()
+            if h and h not in _all_hosts:
+                _all_hosts.append(h)
+                _refresh_lb()
+            new_host_var.set("")
+
+        new_host_entry.bind("<Return>", _add_host)
+        tk.Button(add_row, text="+ Add", font=("Segoe UI", 9),
+                  bg="#2a4a2a", fg="#5cff5c", relief=tk.FLAT, cursor="hand2",
+                  padx=6, pady=3, command=_add_host).pack(side=tk.LEFT)
+
+        test_row = tk.Frame(hosts_panel, bg="#0f0f16")
+        test_row.pack(fill=tk.X, pady=(6, 0))
+
+        conn_lbl = tk.Label(test_row, text="Select a host, then click Test.",
+                            font=("Segoe UI", 8), fg="#5c5c70", bg="#0f0f16", anchor="w")
+        conn_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def _test_connection():
+            sel = hosts_lb.curselection()
+            if not sel:
+                conn_lbl.config(text="Select a host first.", fg="#ffaa00")
+                return
+            host = _all_hosts[sel[0]]
+            conn_lbl.config(text=f"Testing {host}...", fg="#9a9ab0")
+            win.update_idletasks()
+
+            def _do_test():
+                try:
+                    r = requests.get(f"http://{host}:11434/api/tags", timeout=5)
+                    if r.status_code == 200:
+                        models = [m.get("name", "") for m in r.json().get("models", [])]
+                        snippet = ", ".join(models[:4]) or "(no models)"
+                        win.after(0, lambda: conn_lbl.config(
+                            text=f"Connected: {snippet}", fg="#5cff5c"))
+                    else:
+                        win.after(0, lambda: conn_lbl.config(
+                            text=f"HTTP {r.status_code} from {host}", fg="#ffaa00"))
+                except requests.exceptions.ConnectionError:
+                    win.after(0, lambda: conn_lbl.config(
+                        text=f"Unreachable: {host}", fg="#ff5555"))
+                except requests.exceptions.Timeout:
+                    win.after(0, lambda: conn_lbl.config(
+                        text=f"Timed out: {host}", fg="#ff5555"))
+                except Exception as exc:
+                    win.after(0, lambda: conn_lbl.config(
+                        text=f"Error: {exc}", fg="#ff5555"))
+
+            threading.Thread(target=_do_test, daemon=True).start()
+
+        tk.Button(test_row, text="Test Connection", font=("Segoe UI", 9),
+                  bg="#0f2a3a", fg="#44bbee", relief=tk.FLAT, cursor="hand2",
+                  padx=8, pady=3, command=_test_connection).pack(side=tk.RIGHT)
+
         # ── Save ───────────────────────────────────────────────────────────────
         def save():
-            global _tts_voice
+            global _tts_voice, _ollama_host, OLLAMA_URL, OLLAMA_EMBED_URL
             config["hotkey"] = hk_var.get().strip()
             config["tts_voice"] = _KOKORO_VOICES.get(voice_var.get(), "bm_george")
             config["default_mic_mode"] = mic_mode_var.get()
             config["tts_muted_default"] = not voice_on_var.get()
+            config["ollama_hosts"] = list(_all_hosts)
+            if config.get("ollama_host") not in _all_hosts:
+                config["ollama_host"] = _all_hosts[0] if _all_hosts else "localhost"
             _tts_voice = config["tts_voice"]
+            _ollama_host = config["ollama_host"]
+            OLLAMA_URL = f"http://{_ollama_host}:11434/api/chat"
+            OLLAMA_EMBED_URL = f"http://{_ollama_host}:11434/api/embeddings"
             save_config(config)
             win.destroy()
             self._append_message("system",
-                "⚙️ Settings saved. Voice change is live now. Mic/startup defaults apply on next launch. Hotkey requires restart.")
+                f"⚙️ Settings saved. Active Ollama host: {_ollama_host}. Voice change is live. Mic/startup defaults apply on next launch. Hotkey requires restart.")
 
         tk.Button(main_layer, text="Save State", font=("Segoe UI Semibold", 9),
                   bg="#4747b2", fg="white", relief=tk.FLAT, padx=16, pady=6,
                   cursor="hand2", command=save
-                  ).grid(row=4, column=1, pady=14, padx=6, sticky="e")
+                  ).grid(row=7, column=1, pady=14, padx=6, sticky="e")
+
+        win.update_idletasks()
+        win.geometry(f"540x{win.winfo_reqheight() + 12}")
 
     def show(self):
         self.root.deiconify()
@@ -3570,6 +4070,9 @@ if __name__ == "__main__":
     _ui_app = app
     register_hotkey(app)
     start_tray(app)
+
+    _boot_ms = (_time.perf_counter() - _BOOT_START) * 1000
+    print(f"Boot time: {_boot_ms / 1000:.3f}s ({_boot_ms:.0f}ms)")
 
     app.show()
     app.run()
