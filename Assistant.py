@@ -80,8 +80,6 @@ def _bootstrap():
     sys.exit(0)
 
 _bootstrap()
-import time as _time
-_BOOT_START = _time.perf_counter()
 # ─────────────────────────────────────────────────────────────────────────────
 
 import json
@@ -253,6 +251,15 @@ REASON_MODEL = "deepseek-r1:8b"  # deep tier — complex multi-step reasoning (o
 EMBED_MODEL  = "nomic-embed-text"
 ULTRA_DEEP_THINKING_MODEL = "llama3.1:70b"  # ultra tier — requires ~64GB RAM
 
+FAST_MODE      = "fast"
+BALANCED_MODE  = "balanced"
+DEEP_MODE      = "deep"
+SPEED_MODE_LABEL = {
+    FAST_MODE: "Fast",
+    BALANCED_MODE: "Balanced",
+    DEEP_MODE: "Deep",
+}
+
 _active_model = OLLAMA_MODEL  # tracks which model handled the last request
 
 # Keywords that signal a complex, multi-step command → route to reasoning model
@@ -329,21 +336,241 @@ def cosine_similarity(a: list, b: list) -> float:
     return float(np.dot(va, vb) / denom) if denom > 0 else 0.0
 
 def load_config():
+    defaults = {
+        "watched_folder": "",
+        "hotkey": "ctrl+shift+space",
+        "ollama_host": "localhost",
+        "ollama_hosts": ["localhost"],
+        "assistant_speed_mode": BALANCED_MODE,
+    }
     if CONFIG_FILE.exists():
         with open(CONFIG_FILE) as f:
             cfg = json.load(f)
         cfg.pop("openai_api_key", None)
+        for key, value in defaults.items():
+            cfg.setdefault(key, value)
         return cfg
-    return {"watched_folder": "", "hotkey": "ctrl+shift+space", "ollama_host": "localhost", "ollama_hosts": ["localhost"]}
+    return defaults
 
 def save_config(cfg):
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
 config = load_config()
-_ollama_host = config.get("ollama_host", "localhost")
-OLLAMA_URL = f"http://{_ollama_host}:11434/api/chat"
-OLLAMA_EMBED_URL = f"http://{_ollama_host}:11434/api/embeddings"
+_speed_mode = config.get("assistant_speed_mode", BALANCED_MODE)
+
+def _choose_model(prompt: str) -> str:
+    if _speed_mode == FAST_MODE:
+        if _is_trivial(prompt):
+            return CHAT_MODEL
+        return OLLAMA_MODEL
+    if _speed_mode == DEEP_MODE:
+        if _is_trivial(prompt):
+            return CHAT_MODEL
+        return REASON_MODEL
+    if _is_complex(prompt):
+        return REASON_MODEL
+    if _is_trivial(prompt):
+        return CHAT_MODEL
+    return OLLAMA_MODEL
+
+
+def _normalize_ollama_host(raw: str) -> str:
+    """Strip http(s):// scheme and trailing slashes so we only store host[:port]."""
+    h = raw.strip()
+    for scheme in ("https://", "http://"):
+        if h.lower().startswith(scheme):
+            h = h[len(scheme):]
+    return h.rstrip("/")
+
+def _ollama_base_url(host: str) -> str:
+    """Return a full base URL. If host already carries a port, use it; else append :11434."""
+    h = _normalize_ollama_host(host)
+    # Has explicit port already (e.g. "10.0.0.92:11434" or "localhost:9999")
+    if ":" in h:
+        return f"http://{h}"
+    return f"http://{h}:11434"
+
+# Active hosts: list of normalized hosts that will race in parallel.
+# Falls back to the legacy single ollama_host if ollama_active_hosts not set.
+_active_hosts: list = [
+    _normalize_ollama_host(h)
+    for h in config.get("ollama_active_hosts",
+                        [config.get("ollama_host", "localhost")])
+]
+_ollama_host     = _active_hosts[0] if _active_hosts else "localhost"
+OLLAMA_URL       = _ollama_base_url(_ollama_host) + "/api/chat"
+OLLAMA_EMBED_URL = _ollama_base_url(_ollama_host) + "/api/embeddings"
+
+# -- Ollama worker pool -------------------------------------------------------
+# One persistent thread per active host.  All inference requests share a single
+# FIFO queue; whichever worker is free picks up the next task automatically.
+# This gives true load distribution: both machines stay busy as long as there
+# is work to do, and the faster machine naturally handles more requests.
+
+class _OllamaPool:
+    def __init__(self):
+        self._q       = queue.Queue()
+        self._threads: dict = {}          # host -> Thread
+        self._lock    = threading.Lock()
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self, hosts: list):
+        """Ensure a live worker thread exists for every host in `hosts`."""
+        with self._lock:
+            for h in hosts:
+                if h not in self._threads or not self._threads[h].is_alive():
+                    self._spawn(h)
+            # Prune dead threads for hosts no longer active
+            self._threads = {h: t for h, t in self._threads.items()
+                             if t.is_alive()}
+
+    def _spawn(self, host: str):
+        t = threading.Thread(target=self._worker, args=(host,), daemon=True,
+                             name=f"ollama-{host}")
+        t.start()
+        self._threads[host] = t
+
+    # ── public submit ─────────────────────────────────────────────────────────
+
+    def submit(self, payload_snap: dict, timeout_s: int):
+        """Queue a task and block until a worker finishes it.
+        Returns the response dict, None if cancelled, or raises on error."""
+        self.start(_pool_hosts())       # lazy-spawn pool workers for pool-role hosts
+        done_q = queue.Queue()
+        self._q.put({"payload": payload_snap, "timeout": timeout_s,
+                     "done_q": done_q})
+        while True:
+            if _inference_stop.is_set():
+                return None
+            try:
+                result, exc = done_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if exc:
+                raise exc
+            return result
+
+    # ── worker loop ───────────────────────────────────────────────────────────
+
+    def _worker(self, host: str):
+        print(f"[Pool] Worker started: {host}")
+        while host in _active_hosts and host in _pool_hosts():
+            try:
+                task = self._q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            url      = _ollama_base_url(host) + "/api/chat"
+            host_cfg = config.get("ollama_host_settings", {}).get(host, {})
+            num_gpu  = int(host_cfg.get("num_gpu", 999))
+
+            p = dict(task["payload"])
+            p["options"] = {**p.get("options", {}), "num_gpu": num_gpu}
+
+            print(f"[Pool] {host} ← {p.get('model', '?')}")
+
+            try:
+                r = requests.post(url, json=p, timeout=task["timeout"], stream=True)
+                r.raise_for_status()
+            except Exception as exc:
+                task["done_q"].put((None, exc))
+                # Re-spawn so the pool stays healthy after a connection error
+                with self._lock:
+                    self._spawn(host)
+                return
+
+            line_q = queue.Queue()
+            rd_ev  = threading.Event()
+
+            def _rd(resp=r, lq=line_q, ev=rd_ev):
+                try:
+                    for raw in resp.iter_lines():
+                        if ev.is_set() or _inference_stop.is_set():
+                            break
+                        lq.put(raw)
+                except Exception:
+                    pass
+                finally:
+                    lq.put(None)
+
+            threading.Thread(target=_rd, daemon=True).start()
+            chunks  = []
+            aborted = False
+
+            try:
+                while True:
+                    if _inference_stop.is_set():
+                        rd_ev.set()
+                        try: r.close()
+                        except: pass
+                        aborted = True
+                        break
+                    try:
+                        raw = line_q.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if raw is None:
+                        break
+                    if not raw:
+                        continue
+                    try:
+                        chunk = json.loads(raw)
+                    except Exception:
+                        continue
+                    delta = chunk.get("message", {}).get("content", "")
+                    if delta:
+                        chunks.append(delta)
+                    if chunk.get("done"):
+                        break
+            finally:
+                rd_ev.set()
+
+            if aborted:
+                task["done_q"].put((None, None))
+            else:
+                task["done_q"].put(({"message": {"content": "".join(chunks)}}, None))
+
+        print(f"[Pool] Worker stopped: {host}")
+
+
+ollama_pool = _OllamaPool()
+
+# -- Role-based host routing --------------------------------------------------
+# Each active host carries a role tag in ollama_host_settings[host]["role"]:
+#
+#   "primary"  – user-facing chat / commands (direct fast response)
+#   "vision"   – vision model, screen observer, look_at_screen
+#   "pool"     – scheduled tasks, overflow, background LLM work
+#   "all"      – handles any task type (default; good for single-machine setups)
+#
+# _hosts_for(role) returns all active hosts tagged with that role.
+# If none are tagged, it falls back to "all"-tagged hosts, then any host.
+# This means a freshly added host with role="all" works with zero extra config.
+
+def _hosts_for(role: str) -> list:
+    """Return active hosts assigned to `role`, with graceful fallbacks."""
+    hs = config.get("ollama_host_settings", {})
+    exact      = [h for h in _active_hosts if hs.get(h, {}).get("role", "all") == role]
+    if exact:
+        return exact
+    versatile  = [h for h in _active_hosts if hs.get(h, {}).get("role", "all") == "all"]
+    if versatile:
+        return versatile
+    return list(_active_hosts) or ["localhost"]
+
+def _primary_host() -> str:
+    return _hosts_for("primary")[0]
+
+def _bg_host() -> str:
+    hosts = _hosts_for("vision")
+    return hosts[0]
+
+def _pool_hosts() -> list:
+    return _hosts_for("pool")
+
+# ─────────────────────────────────────────────────────────────────────────────
 _tts_voice = config.get("tts_voice", "bm_george")
 CHAT_MEMORY = []
 _SESSION_ID = str(uuid.uuid4())  # unique ID for this app launch
@@ -436,29 +663,65 @@ def set_audio_device(index: int) -> str:
     save_config(config)
     return f"🔊 Audio output switched to device [{index}]. Takes effect immediately."
 
+def _pycaw_volume_interface():
+    """Return IAudioEndpointVolume, trying every known pycaw API variant."""
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    from comtypes import CLSCTX_ALL
+
+    spk = AudioUtilities.GetSpeakers()
+
+    # Attempt 1 — old pycaw: spk IS the raw COM IMMDevice
+    try:
+        return spk.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None).QueryInterface(IAudioEndpointVolume)
+    except Exception:
+        pass
+
+    # Attempt 2 — newer pycaw: spk is AudioDevice wrapper, raw device in ._dev
+    for attr in ("_dev", "_device", "_immdevice", "_raw"):
+        raw = getattr(spk, attr, None)
+        if raw is None:
+            continue
+        try:
+            return raw.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None).QueryInterface(IAudioEndpointVolume)
+        except Exception:
+            continue
+
+    raise RuntimeError("pycaw: no working Activate path found")
+
+def _set_volume_via_keys(target: int) -> bool:
+    """Fallback: press media volume keys to reach the target percentage.
+    Each Windows volume keypress = ~2 percentage points."""
+    import ctypes
+    VK_VOL_DOWN, VK_VOL_UP, KEYUP = 0xAE, 0xAF, 0x02
+    current = get_volume()
+    if current < 0:
+        return False
+    diff  = target - current
+    key   = VK_VOL_UP if diff > 0 else VK_VOL_DOWN
+    steps = max(1, round(abs(diff) / 2))
+    for _ in range(steps):
+        ctypes.windll.user32.keybd_event(key, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(key, 0, KEYUP, 0)
+    return True
+
 def get_volume() -> int:
     try:
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        from comtypes import CLSCTX_ALL
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = interface.QueryInterface(IAudioEndpointVolume)
-        return int(volume.GetMasterVolumeLevelScalar() * 100)
+        return int(_pycaw_volume_interface().GetMasterVolumeLevelScalar() * 100)
     except Exception:
         return -1
 
 def set_volume(level: int) -> str:
+    level = max(0, min(100, level))
+    # Try pycaw (direct COM call)
     try:
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-        from comtypes import CLSCTX_ALL
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = interface.QueryInterface(IAudioEndpointVolume)
-        level = max(0, min(100, level))
-        volume.SetMasterVolumeLevelScalar(level / 100.0, None)
+        _pycaw_volume_interface().SetMasterVolumeLevelScalar(level / 100.0, None)
         return f"🔊 Volume set to {level}%"
-    except Exception as e:
-        return f"❌ Volume control failed: {e}"
+    except Exception:
+        pass
+    # Fallback: media key presses
+    if _set_volume_via_keys(level):
+        return f"🔊 Volume set to ~{level}%"
+    return "❌ Volume control failed — please adjust manually."
 
 # -- Feedback & Learning System ----------------------------------------------
 MEMORY_DIR = Path(__file__).parent / "memory"
@@ -488,17 +751,24 @@ class ChatHistoryDB:
     """
 
     def __init__(self, db_path: Path):
-        self._path = str(db_path)
-        self._lock = threading.Lock()
+        self._path    = str(db_path)
+        self._lock    = threading.Lock()
+        self._conn_obj = None   # persistent connection — created once, reused
         self._init_db()
 
     def _conn(self):
-        conn = sqlite3.connect(self._path, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        if self._conn_obj is None:
+            c = sqlite3.connect(self._path, check_same_thread=False)
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")   # safe in WAL; ~5x faster writes
+            c.execute("PRAGMA cache_size=-20000")    # 20 MB page cache
+            c.execute("PRAGMA temp_store=MEMORY")
+            self._conn_obj = c
+        return self._conn_obj
 
     def _init_db(self):
-        with self._lock, self._conn() as conn:
+        with self._lock:
+            conn = self._conn()
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS chat_history (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -511,6 +781,7 @@ class ChatHistoryDB:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_session   ON chat_history(session_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_history(timestamp)")
+            conn.commit()
 
     def save_exchange(self, user_text: str, assistant_text: str, user_emb: list):
         """Save a Q+A pair. Embedding is stored for the combined pair (better recall)."""
@@ -521,7 +792,8 @@ class ChatHistoryDB:
 
         now = time.time()
         def _write():
-            with self._lock, self._conn() as conn:
+            with self._lock:
+                conn = self._conn()
                 conn.execute(
                     "INSERT INTO chat_history(session_id,role,content,timestamp,embedding) VALUES(?,?,?,?,?)",
                     (_SESSION_ID, "user", user_text[:2000], now, emb_blob)
@@ -530,6 +802,7 @@ class ChatHistoryDB:
                     "INSERT INTO chat_history(session_id,role,content,timestamp,embedding) VALUES(?,?,?,?,?)",
                     (_SESSION_ID, "assistant", assistant_text[:2000], now + 0.001, None)
                 )
+                conn.commit()
         threading.Thread(target=_write, daemon=True).start()
 
     def get_relevant_history(self, query_emb: list, top_k: int = 3,
@@ -538,54 +811,51 @@ class ChatHistoryDB:
         if not query_emb:
             return ""
         try:
-            q_vec = np.array(query_emb, dtype=np.float32)
+            q_vec  = np.array(query_emb, dtype=np.float32)
             q_norm = np.linalg.norm(q_vec)
             if q_norm == 0:
                 return ""
 
-            with self._lock, self._conn() as conn:
-                # Only fetch rows that have embeddings (user turns)
+            # Single query: fetch user rows + their assistant reply in one shot
+            with self._lock:
+                conn = self._conn()
                 rows = conn.execute(
-                    "SELECT id, content, timestamp, embedding FROM chat_history "
-                    "WHERE role='user' AND embedding IS NOT NULL "
-                    "ORDER BY timestamp DESC LIMIT 500"
+                    """SELECT h.content, h.timestamp, h.embedding,
+                              (SELECT a.content FROM chat_history a
+                               WHERE a.role='assistant' AND a.timestamp > h.timestamp
+                               ORDER BY a.timestamp ASC LIMIT 1)
+                       FROM chat_history h
+                       WHERE h.role='user' AND h.embedding IS NOT NULL
+                       ORDER BY h.timestamp DESC LIMIT 500"""
                 ).fetchall()
 
             if not rows:
                 return ""
 
-            scored = []
-            for row_id, content, ts, blob in rows:
-                vec = np.frombuffer(blob, dtype=np.float32)
-                norm = np.linalg.norm(vec)
-                if norm == 0:
-                    continue
-                sim = float(np.dot(q_vec, vec) / (q_norm * norm))
-                if sim > 0.30:
-                    scored.append((sim, ts, row_id, content))
+            contents, _, blobs, replies = zip(*rows)
 
-            if not scored:
+            # Batch cosine similarity — one matrix multiply instead of N dot products
+            dim = len(q_vec)
+            valid_idx = [i for i, b in enumerate(blobs) if len(b) == dim * 4]
+            if not valid_idx:
                 return ""
+            mat   = np.stack([np.frombuffer(blobs[i], dtype=np.float32) for i in valid_idx])
+            norms = np.linalg.norm(mat, axis=1)
+            sims  = np.where(norms > 0, (mat @ q_vec) / (norms * q_norm), 0.0)
 
-            scored.sort(key=lambda x: x[0], reverse=True)
-            top = scored[:top_k]
+            above = np.where(sims > 0.30)[0]
+            if len(above) == 0:
+                return ""
+            top_local = above[np.argsort(sims[above])[::-1][:top_k]]
 
-            # For each matched user turn, fetch the assistant reply that follows it
             lines = ["Relevant past conversations:"]
-            with self._lock, self._conn() as conn:
-                for _, ts, row_id, user_content in top:
-                    reply_row = conn.execute(
-                        "SELECT content FROM chat_history WHERE role='assistant' "
-                        "AND timestamp > ? ORDER BY timestamp ASC LIMIT 1",
-                        (ts,)
-                    ).fetchone()
-                    reply = reply_row[0][:300] if reply_row else "(no reply)"
-                    lines.append(f"  Q: {user_content[:200]}")
-                    lines.append(f"  A: {reply}")
+            for li in top_local:
+                gi = valid_idx[li]
+                reply = (replies[gi] or "(no reply)")[:300]
+                lines.append(f"  Q: {contents[gi][:200]}")
+                lines.append(f"  A: {reply}")
 
-            result = "\n".join(lines)
-            # Hard cap at 3,200 chars so it never floods the prompt
-            return result[:3200]
+            return "\n".join(lines)[:3200]
         except Exception:
             return ""
 
@@ -613,7 +883,7 @@ class ChatHistoryDB:
             return []
 
     def reset(self):
-        """Wipe all stored history. Opens and explicitly closes a connection so no lock lingers."""
+        """Wipe all stored history. Closes the persistent connection so no lock lingers."""
         with self._lock:
             conn = self._conn()
             try:
@@ -624,7 +894,9 @@ class ChatHistoryDB:
             except Exception:
                 pass
             finally:
-                conn.close()
+                try: conn.close()
+                except Exception: pass
+                self._conn_obj = None
 
 chat_db = ChatHistoryDB(CHAT_HISTORY_DB)
 _memory_warned = False  # show the memory-size warning at most once per session
@@ -714,14 +986,34 @@ def detect_verbal_feedback(text: str):
             return "negative"
     return None
 
+_FILE_CACHE: dict = {}   # str(path) → {"data": ..., "mtime": float}
+
+def _cached_json(path: Path, default):
+    """Read JSON from path, caching by mtime — avoids disk hits on every message."""
+    key = str(path)
+    try:
+        mtime = path.stat().st_mtime if path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    entry = _FILE_CACHE.get(key)
+    if entry and entry["mtime"] == mtime:
+        return entry["data"]
+    if mtime == 0.0:
+        _FILE_CACHE[key] = {"data": default, "mtime": 0.0}
+        return default
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        _FILE_CACHE[key] = {"data": data, "mtime": mtime}
+        return data
+    except Exception:
+        return default
+
+def _invalidate_cache(path: Path):
+    _FILE_CACHE.pop(str(path), None)
+
 def load_feedback() -> dict:
-    if FEEDBACK_FILE.exists():
-        try:
-            with open(FEEDBACK_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"interactions": []}
+    return _cached_json(FEEDBACK_FILE, {"interactions": []})
 
 def save_feedback_entry(rating: int):
     if not LAST_INTERACTION["text"]:
@@ -741,6 +1033,7 @@ def save_feedback_entry(rating: int):
     try:
         with open(FEEDBACK_FILE, "w") as f:
             json.dump(data, f, indent=2)
+        _invalidate_cache(FEEDBACK_FILE)
     except Exception:
         pass
     sign = "+" if rating > 0 else ""
@@ -792,13 +1085,7 @@ def get_learned_context(query: str = "", emb: list = None) -> str:
 
 # -- Explicit Memory System --------------------------------------------------
 def load_explicit_memories() -> list:
-    if EXPLICIT_MEMORY_FILE.exists():
-        try:
-            with open(EXPLICIT_MEMORY_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+    return _cached_json(EXPLICIT_MEMORY_FILE, [])
 
 def save_explicit_memory(fact: str):
     memories = load_explicit_memories()
@@ -811,6 +1098,7 @@ def save_explicit_memory(fact: str):
     try:
         with open(EXPLICIT_MEMORY_FILE, "w") as f:
             json.dump(memories, f, indent=2)
+        _invalidate_cache(EXPLICIT_MEMORY_FILE)
     except Exception:
         pass
 
@@ -844,13 +1132,7 @@ def get_relevant_memories(query: str, emb: list = None) -> str:
 
 # -- Playbook (Macro Learning) -----------------------------------------------
 def load_playbooks() -> list:
-    if PLAYBOOK_FILE.exists():
-        try:
-            with open(PLAYBOOK_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+    return _cached_json(PLAYBOOK_FILE, [])
 
 def save_playbook(description: str, actions: list):
     playbooks = load_playbooks()
@@ -865,6 +1147,7 @@ def save_playbook(description: str, actions: list):
     try:
         with open(PLAYBOOK_FILE, "w") as f:
             json.dump(playbooks, f, indent=2)
+        _invalidate_cache(PLAYBOOK_FILE)
     except Exception:
         pass
 
@@ -1089,6 +1372,26 @@ class TaskScheduler:
 task_scheduler = TaskScheduler()
 
 # -- Vocal Response System ---------------------------------------------------
+_TTS_SKIP_STARTS = (
+    "❌", "⚠️", "🌐", "📸", "📁", "📜", "⬅", "➡", "⬇", "⬆",
+    "📷", "🎤", "⚙", "🗑", "📺", "✈", "🧠", "👤", "⏹", "⌨",
+    "🔍", "📋", "💡", "⏳", "🔇", "🔊", "🎙",
+    "No visible", "Could not", "Browser error", "Links on page",
+    "Open tabs", "Switched to", "Scrolled", "Waited ", "Tab closed",
+    "====", "----",
+)
+def _tts_filter(text: str) -> str:
+    """Return only the conversational lines worth speaking aloud."""
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(stripped.startswith(p) for p in _TTS_SKIP_STARTS):
+            continue
+        lines.append(stripped)
+    return " ".join(lines)
+
 def speak(text, app_instance=None):
     # Respect explicit mute flag — voice_mode no longer gates TTS output
     if app_instance and getattr(app_instance, 'tts_muted', False):
@@ -1096,6 +1399,10 @@ def speak(text, app_instance=None):
         return
     if not text or not text.strip():
         print("[TTS] Empty text — skipping.")
+        return
+    text = _tts_filter(text)
+    if not text:
+        print("[TTS] No speakable content — skipping.")
         return
     # Self-heal: restart TTS thread if it crashed
     if _tts_thread is not None and not _tts_thread.is_alive():
@@ -1471,13 +1778,50 @@ class BrowserAgent:
     def search_web(self, query: str) -> str:
         self._ensure()
         try:
-            self._page.goto("https://www.google.com", wait_until="domcontentloaded")
-            search_box = self._page.locator('textarea[name="q"]').first
+            self._page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=20000)
+            # Dismiss consent/cookie popup if present
+            for consent_text in ("Accept all", "Agree", "I agree", "Accept", "Reject all"):
+                try:
+                    btn = self._page.get_by_role("button", name=consent_text, exact=False)
+                    if btn.first.is_visible(timeout=1500):
+                        btn.first.click()
+                        self._page.wait_for_timeout(600)
+                        break
+                except Exception:
+                    pass
+            # Type query
+            search_box = self._page.locator('textarea[name="q"], input[name="q"]').first
+            search_box.click()
             search_box.fill(query)
             self._page.keyboard.press("Enter")
-            self._page.wait_for_load_state("networkidle")
-            return f"🌐 Searched Google for: {query}"
-        except Exception as e: return f"❌ Search failed: {e}"
+            # Wait for results
+            try:
+                self._page.wait_for_selector("#search, #rso, .g", timeout=12000)
+            except Exception:
+                self._page.wait_for_load_state("networkidle", timeout=10000)
+            # Extract top results (title + url)
+            results = self._page.evaluate("""() => {
+                const out = [];
+                const cards = document.querySelectorAll('#rso .g, #search .g');
+                for (const card of cards) {
+                    const a = card.querySelector('a[href]');
+                    const h = card.querySelector('h3');
+                    if (!a || !h) continue;
+                    const href = a.href;
+                    if (!href || href.includes('google.com')) continue;
+                    out.push({ title: h.innerText.trim(), url: href });
+                    if (out.length >= 6) break;
+                }
+                return out;
+            }""")
+            if results:
+                lines = [f"🌐 Google results for: {query}"]
+                for i, r in enumerate(results, 1):
+                    lines.append(f"  {i}. {r['title']}  →  {r['url']}")
+                return "\n".join(lines)
+            return f"🌐 Searched Google for: {query} (use browse_links to see results)"
+        except Exception as e:
+            return f"❌ Search failed: {e}"
 
     _KEY_MAP = {
         "escape": "Escape", "esc": "Escape",
@@ -1624,9 +1968,168 @@ class BrowserAgent:
         return "❌ No visible text input found on the page"
 
     def get_page_text(self) -> str:
+        """Extract readable content — strips nav/header/footer noise, prefers <article>/<main>."""
         self._ensure()
-        try: return self._page.inner_text("body")[:3000]
-        except Exception: return ""
+        try:
+            return self._page.evaluate("""() => {
+                // Remove noise elements in-place (clone to avoid mutating the live DOM)
+                const clone = document.cloneNode(true);
+                const noise = clone.querySelectorAll(
+                    'nav, header, footer, aside, .sidebar, .nav, .menu, .ad, .ads, ' +
+                    '.advertisement, [role="navigation"], [role="banner"], [role="contentinfo"], ' +
+                    'script, style, noscript, iframe');
+                noise.forEach(n => n.remove());
+                // Prefer article or main
+                const main = clone.querySelector('article') ||
+                              clone.querySelector('main') ||
+                              clone.querySelector('[role="main"]') ||
+                              clone.querySelector('.content') ||
+                              clone.querySelector('#content') ||
+                              clone.body;
+                return (main ? main.innerText : clone.body.innerText)
+                    .replace(/\\n{3,}/g, '\\n\\n').trim().slice(0, 6000);
+            }""") or ""
+        except Exception:
+            try: return self._page.inner_text("body")[:6000]
+            except Exception: return ""
+
+    def go_back(self) -> str:
+        self._ensure()
+        try:
+            self._page.go_back(timeout=15000)
+            return f"⬅ Back → {self._page.title() or self._page.url}"
+        except Exception as e:
+            return f"❌ Can't go back: {e}"
+
+    def go_forward(self) -> str:
+        self._ensure()
+        try:
+            self._page.go_forward(timeout=15000)
+            return f"➡ Forward → {self._page.title() or self._page.url}"
+        except Exception as e:
+            return f"❌ Can't go forward: {e}"
+
+    def scroll(self, direction: str = "down", amount: int = 60) -> str:
+        """Scroll the page. direction='down'|'up'|'top'|'bottom', amount=% of viewport height."""
+        self._ensure()
+        try:
+            if direction == "top":
+                self._page.evaluate("window.scrollTo(0, 0)")
+                return "⬆ Scrolled to top."
+            if direction == "bottom":
+                self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                return "⬇ Scrolled to bottom."
+            pct  = max(5, min(200, int(amount)))
+            sign = 1 if direction != "up" else -1
+            self._page.evaluate(
+                f"window.scrollBy(0, Math.round(window.innerHeight * {sign * pct / 100}))")
+            label = "⬇ Scrolled down" if sign > 0 else "⬆ Scrolled up"
+            return f"{label} {pct}%."
+        except Exception as e:
+            return f"❌ Scroll error: {e}"
+
+    def get_links(self) -> str:
+        """Return visible links on the current page (text + URL), up to 30."""
+        self._ensure()
+        try:
+            links = self._page.evaluate("""() => {
+                const seen = new Set();
+                const out  = [];
+                for (const a of document.querySelectorAll('a[href]')) {
+                    const r = a.getBoundingClientRect();
+                    if (r.width < 1 || r.height < 1) continue;
+                    const href = a.href;
+                    if (!href || href.startsWith('javascript:') || seen.has(href)) continue;
+                    seen.add(href);
+                    const text = a.textContent.replace(/\\s+/g, ' ').trim().slice(0, 80);
+                    if (!text) continue;
+                    out.push(text + '  →  ' + href);
+                    if (out.length >= 30) break;
+                }
+                return out;
+            }""")
+            if not links:
+                return "No visible links found on this page."
+            return "Links on page:\n" + "\n".join(f"  {l}" for l in links)
+        except Exception as e:
+            return f"❌ Link extraction error: {e}"
+
+    def wait_for(self, target: str = "2") -> str:
+        """Wait N seconds (e.g. '3') or for a CSS selector to appear (e.g. '.results')."""
+        self._ensure()
+        try:
+            try:
+                secs = float(target)
+                secs = max(0.5, min(30, secs))
+                import time as _t; _t.sleep(secs)
+                return f"⏳ Waited {secs}s."
+            except ValueError:
+                self._page.wait_for_selector(target, timeout=15000)
+                return f"✅ Element appeared: {target}"
+        except Exception as e:
+            return f"❌ Wait error: {e}"
+
+    def new_tab(self, url: str = "") -> str:
+        """Open a new browser tab, optionally navigating to url."""
+        self._ensure()
+        try:
+            new_page = self._browser.new_page()
+            self._page = new_page
+            if url:
+                return self.navigate(url)
+            return f"✅ New tab opened (tab {len(self._browser.pages)})."
+        except Exception as e:
+            return f"❌ New tab error: {e}"
+
+    def list_tabs(self) -> str:
+        """List all open browser tabs."""
+        self._ensure()
+        try:
+            pages = self._browser.pages
+            if not pages:
+                return "No open tabs."
+            lines = [f"Open tabs ({len(pages)}):"]
+            for i, p in enumerate(pages):
+                marker = " ◀ active" if p == self._page else ""
+                try:
+                    title = p.title() or p.url
+                except Exception:
+                    title = "(loading)"
+                lines.append(f"  [{i}] {title[:80]}{marker}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"❌ Tab list error: {e}"
+
+    def switch_tab(self, index: int) -> str:
+        """Switch to a browser tab by index (0-based)."""
+        self._ensure()
+        try:
+            pages = self._browser.pages
+            idx = int(index)
+            if idx < 0 or idx >= len(pages):
+                return f"❌ Tab {idx} does not exist. Use browse_tabs to see open tabs."
+            self._page = pages[idx]
+            self._page.bring_to_front()
+            return f"✅ Switched to tab {idx}: {self._page.title() or self._page.url}"
+        except Exception as e:
+            return f"❌ Switch tab error: {e}"
+
+    def close_tab(self) -> str:
+        """Close the current browser tab and switch to the previous one."""
+        self._ensure()
+        try:
+            pages = self._browser.pages
+            if len(pages) <= 1:
+                return "❌ Only one tab open — use browse_navigate to go somewhere instead."
+            current = self._page
+            idx = pages.index(current)
+            current.close()
+            remaining = self._browser.pages
+            self._page = remaining[max(0, idx - 1)]
+            self._page.bring_to_front()
+            return f"✅ Tab closed. Now on: {self._page.title() or self._page.url}"
+        except Exception as e:
+            return f"❌ Close tab error: {e}"
 
     def get_page_context(self) -> str:
         """Return page title, URL, and visible interactive elements for LLM context."""
@@ -1702,15 +2205,24 @@ browser_agent = BrowserAgent()
 
 def run_browser_action(action: str, args: dict) -> str:
     try:
-        if action == "browse_navigate": return browser_agent.execute(browser_agent.navigate, args.get("url", ""))
-        elif action == "browse_search": return browser_agent.execute(browser_agent.search_web, args.get("query", ""))
-        elif action == "browse_click": return browser_agent.execute(browser_agent.click, args.get("target", ""))
-        elif action == "browse_type": return browser_agent.execute(browser_agent.type_text, args.get("selector", ""), args.get("text", ""))
-        elif action == "browse_type_cursor": return browser_agent.execute(browser_agent.type_at_cursor, args.get("text", ""))
-        elif action == "browse_screenshot": return browser_agent.execute(browser_agent.screenshot, args.get("filename", "screenshot.png"))
-        elif action == "browse_read": return browser_agent.execute(browser_agent.get_page_text)
-        elif action == "browse_key": return browser_agent.execute(browser_agent.press_key, args.get("key", ""))
-        elif action == "browse_task": return browser_agent.execute(browser_agent.run_task, args.get("task", ""))
+        if   action == "browse_navigate":    return browser_agent.execute(browser_agent.navigate,        args.get("url", ""))
+        elif action == "browse_search":      return browser_agent.execute(browser_agent.search_web,      args.get("query", ""))
+        elif action == "browse_click":       return browser_agent.execute(browser_agent.click,           args.get("target", ""))
+        elif action == "browse_type":        return browser_agent.execute(browser_agent.type_text,       args.get("selector", ""), args.get("text", ""))
+        elif action == "browse_type_cursor": return browser_agent.execute(browser_agent.type_at_cursor,  args.get("text", ""))
+        elif action == "browse_screenshot":  return browser_agent.execute(browser_agent.screenshot,      args.get("filename", "screenshot.png"))
+        elif action == "browse_read":        return browser_agent.execute(browser_agent.get_page_text)
+        elif action == "browse_key":         return browser_agent.execute(browser_agent.press_key,       args.get("key", ""))
+        elif action == "browse_task":        return browser_agent.execute(browser_agent.run_task,        args.get("task", ""))
+        elif action == "browse_scroll":      return browser_agent.execute(browser_agent.scroll,          args.get("direction", "down"), args.get("amount", 60))
+        elif action == "browse_back":        return browser_agent.execute(browser_agent.go_back)
+        elif action == "browse_forward":     return browser_agent.execute(browser_agent.go_forward)
+        elif action == "browse_links":       return browser_agent.execute(browser_agent.get_links)
+        elif action == "browse_wait":        return browser_agent.execute(browser_agent.wait_for,        args.get("target", "2"))
+        elif action == "browse_new_tab":     return browser_agent.execute(browser_agent.new_tab,         args.get("url", ""))
+        elif action == "browse_tabs":        return browser_agent.execute(browser_agent.list_tabs)
+        elif action == "browse_switch_tab":  return browser_agent.execute(browser_agent.switch_tab,      args.get("index", 0))
+        elif action == "browse_close_tab":   return browser_agent.execute(browser_agent.close_tab)
         return f"❌ Unknown browser action: {action}"
     except Exception as e: return f"❌ Browser error: {e}"
 
@@ -2043,11 +2555,14 @@ class CameraEngine:
             return self._frame.copy() if self._frame is not None else None
 
     def _load_yolo(self):
-        if self._yolo is None:
-            print("[Camera] Loading YOLOv8 nano model (downloads ~6 MB on first use)...")
-            from ultralytics import YOLO
-            self._yolo = YOLO(self.YOLO_MODEL)
-            print("[Camera] YOLO ready.")
+        if self._yolo is not None:
+            return
+        with self._yolo_lock:           # only one thread loads the model
+            if self._yolo is None:      # re-check inside lock (double-checked locking)
+                print("[Camera] Loading YOLOv8 nano model (downloads ~6 MB on first use)...")
+                from ultralytics import YOLO
+                self._yolo = YOLO(self.YOLO_MODEL)
+                print("[Camera] YOLO ready.")
 
     def _frame_to_b64(self, frame) -> str:
         import cv2
@@ -2094,7 +2609,7 @@ class CameraEngine:
             return "📦 Objects detected:\n" + "\n".join(f"  • {v}× {k}" for k, v in items)
         except Exception as e:
             return f"❌ Object detection error: {e}"
-
+# Furry Femboy Gay 
     def analyze_face(self) -> str:
         frame = self._get_frame()
         if frame is None:
@@ -2119,54 +2634,92 @@ class CameraEngine:
         except Exception as e:
             return f"❌ Face analysis error: {e}"
 
+    def _crop_face(self, frame):
+        """Return (cropped_face, rect) for the largest detected face, or (None, None)."""
+        import cv2
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5,
+                                         minSize=(60, 60))
+        if len(faces) == 0:
+            return None, None
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])  # largest face
+        pad = int(min(w, h) * 0.25)
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(fw, x + w + pad), min(fh, y + h + pad)
+        return frame[y1:y2, x1:x2], (x, y, w, h)
+
     def remember_face(self, name: str) -> str:
         import cv2
         if not self._running:
             return "❌ Camera not started — open the camera window first."
-        # Wait up to 2 seconds for the first frame to arrive after camera start
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
-            frame = self._get_frame()
-            if frame is not None:
-                break
-            time.sleep(0.05)
-        else:
-            return "❌ Camera started but no frame received yet — try again."
         person_dir = KNOWN_FACES_DIR / name.lower().replace(" ", "_")
         person_dir.mkdir(exist_ok=True)
-        idx  = len(list(person_dir.glob("*.jpg"))) + 1
-        path = person_dir / f"face_{idx}.jpg"
-        cv2.imwrite(str(path), frame)
-        return f"✅ Face saved for '{name}'. I'll recognize you next time."
+        existing = len(list(person_dir.glob("*.jpg")))
+        saved, attempts = 0, 0
+        TARGET, MAX_ATTEMPTS = 5, 20
+        while saved < TARGET and attempts < MAX_ATTEMPTS:
+            frame = None
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                frame = self._get_frame()
+                if frame is not None:
+                    break
+                time.sleep(0.05)
+            attempts += 1
+            if frame is None:
+                continue
+            crop, _ = self._crop_face(frame)
+            if crop is None:
+                time.sleep(0.15)
+                continue
+            path = person_dir / f"face_{existing + saved + 1}.jpg"
+            cv2.imwrite(str(path), crop)
+            saved += 1
+            time.sleep(0.5)  # pause so each sample captures a slightly different angle
+        if saved == 0:
+            return "❌ No face detected — make sure your face is clearly visible and try again."
+        return (f"✅ Saved {saved} face sample{'s' if saved > 1 else ''} for '{name}'."
+                f" More samples = better recognition (you have {existing + saved} total).")
 
     def identify_face(self) -> str:
         import cv2, tempfile
         if not self._running:
             return "❌ Camera not started — open the camera window first."
+        frame = None
         deadline = time.time() + 2.0
         while time.time() < deadline:
             frame = self._get_frame()
             if frame is not None:
                 break
             time.sleep(0.05)
-        else:
+        if frame is None:
             return "❌ Camera started but no frame received yet — try again."
         subdirs = [d for d in KNOWN_FACES_DIR.iterdir() if d.is_dir()]
         if not subdirs:
             return "❌ No saved faces yet. Say 'remember my face as [name]' to train me."
+        crop, _ = self._crop_face(frame)
+        if crop is None:
+            return "👤 No face visible in the camera — move closer and try again."
         try:
             DeepFace = _get_deepface()
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 tmp_path = tmp.name
-            cv2.imwrite(tmp_path, frame)
+            cv2.imwrite(tmp_path, crop)
             result = DeepFace.find(img_path=tmp_path,
                                    db_path=str(KNOWN_FACES_DIR),
                                    enforce_detection=False, silent=True)
             try: os.unlink(tmp_path)
             except OSError: pass
             if result and len(result) > 0 and not result[0].empty:
-                identity_path = result[0].iloc[0]["identity"]
-                name = Path(identity_path).parent.name.replace("_", " ").title()
+                top  = result[0].iloc[0]
+                name = Path(top["identity"]).parent.name.replace("_", " ").title()
+                dist_col = next((c for c in top.index if "distance" in c.lower()), None)
+                if dist_col:
+                    pct = max(0, min(100, int((1.0 - float(top[dist_col])) * 100)))
+                    return f"👤 Recognized: {name}  ({pct}% confidence)"
                 return f"👤 I recognize: {name}"
             return "👤 Face not recognized — not in my saved faces."
         except Exception as e:
@@ -2188,6 +2741,999 @@ class CameraEngine:
         return f"❌ No saved face for '{name}'."
 
 camera_engine = CameraEngine()
+
+# -- Spotify API (OAuth 2.0 PKCE — no dev account needed for users) -----------
+# Register ONE Spotify app at developer.spotify.com, add http://127.0.0.1:8080
+# as a redirect URI, paste your Client ID below. Users never need a dev account.
+_SPOTIFY_BUNDLED_CLIENT_ID = ""   # ← paste your Client ID here
+
+class SpotifyAPI:
+    AUTH_URL     = "https://accounts.spotify.com/authorize"
+    TOKEN_URL    = "https://accounts.spotify.com/api/token"
+    API_BASE     = "https://api.spotify.com/v1"
+    REDIRECT_URI = "http://127.0.0.1:8080"
+    SCOPES       = ("user-read-playback-state user-modify-playback-state "
+                    "user-read-currently-playing streaming playlist-read-private")
+
+    def __init__(self):
+        self._access_token  = None
+        self._token_expiry  = 0.0
+        self._pkce_verifier = None   # set during PKCE auth, kept for refresh
+
+    def _client_id(self) -> str:
+        return config.get("spotify_client_id", "").strip() or _SPOTIFY_BUNDLED_CLIENT_ID
+
+    def _client_secret(self) -> str:
+        return config.get("spotify_client_secret", "").strip()
+
+    def _refresh_token(self) -> str:
+        return config.get("spotify_refresh_token", "").strip()
+
+    def ready(self) -> bool:
+        return bool(self._client_id())   # secret not required when using PKCE
+
+    def _use_pkce(self) -> bool:
+        return not self._client_secret()
+
+    def _b64_creds(self) -> str:
+        return base64.b64encode(f"{self._client_id()}:{self._client_secret()}".encode()).decode()
+
+    def _pkce_verifier_and_challenge(self) -> tuple[str, str]:
+        import hashlib, secrets
+        verifier = secrets.token_urlsafe(64)
+        digest   = hashlib.sha256(verifier.encode()).digest()
+        challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return verifier, challenge
+
+    def _refresh(self) -> bool:
+        rt = self._refresh_token()
+        if not rt:
+            return False
+        try:
+            if self._use_pkce():
+                data = {"grant_type": "refresh_token", "refresh_token": rt,
+                        "client_id": self._client_id()}
+                r = requests.post(self.TOKEN_URL,
+                                  headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                  data=data, timeout=10)
+            else:
+                r = requests.post(self.TOKEN_URL,
+                                  headers={"Authorization": f"Basic {self._b64_creds()}",
+                                           "Content-Type": "application/x-www-form-urlencoded"},
+                                  data={"grant_type": "refresh_token", "refresh_token": rt},
+                                  timeout=10)
+            d = r.json()
+            self._access_token = d.get("access_token")
+            self._token_expiry = time.time() + d.get("expires_in", 3600)
+            if d.get("refresh_token"):
+                config["spotify_refresh_token"] = d["refresh_token"]
+                save_config(config)
+            return bool(self._access_token)
+        except Exception:
+            return False
+
+    def token(self) -> str | None:
+        if self._access_token and time.time() < self._token_expiry - 60:
+            return self._access_token
+        return self._access_token if self._refresh() else None
+
+    def _api(self, method: str, path: str, **kwargs) -> "requests.Response | None":
+        t = self.token()
+        if not t:
+            return None
+        hdrs = {"Authorization": f"Bearer {t}"}
+        hdrs.update(kwargs.pop("headers", {}))
+        return getattr(requests, method)(f"{self.API_BASE}{path}", headers=hdrs,
+                                         timeout=10, **kwargs)
+
+    # ── Auth ──────────────────────────────────────────────────────────────────
+    def authorize(self) -> str:
+        import urllib.parse, http.server, threading, webbrowser
+        if not self.ready():
+            return "❌ Spotify isn't configured yet. Ask the developer to add the Client ID."
+        auth_code: list[str | None] = [None]
+
+        if self._use_pkce():
+            verifier, challenge = self._pkce_verifier_and_challenge()
+            self._pkce_verifier = verifier
+            params = {"client_id": self._client_id(), "response_type": "code",
+                      "redirect_uri": self.REDIRECT_URI, "scope": self.SCOPES,
+                      "state": "jarvis", "code_challenge_method": "S256",
+                      "code_challenge": challenge}
+        else:
+            params = {"client_id": self._client_id(), "response_type": "code",
+                      "redirect_uri": self.REDIRECT_URI, "scope": self.SCOPES, "state": "jarvis"}
+
+        auth_url = self.AUTH_URL + "?" + urllib.parse.urlencode(params)
+
+        class _H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                if "code" in qs:
+                    auth_code[0] = qs["code"][0]
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b"<h2>Authorized! You can close this tab.</h2>")
+            def log_message(self, *_): pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 8080), _H)
+        srv.timeout = 120
+        threading.Thread(target=lambda: [srv.handle_request() for _ in range(5)],
+                         daemon=True).start()
+        webbrowser.open(auth_url)
+
+        deadline = time.time() + 120
+        while not auth_code[0] and time.time() < deadline:
+            time.sleep(0.5)
+
+        if not auth_code[0]:
+            return "❌ Authorization timed out. Try again."
+        try:
+            if self._use_pkce():
+                data = {"grant_type": "authorization_code", "code": auth_code[0],
+                        "redirect_uri": self.REDIRECT_URI, "client_id": self._client_id(),
+                        "code_verifier": self._pkce_verifier}
+                r = requests.post(self.TOKEN_URL,
+                                  headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                  data=data, timeout=10)
+            else:
+                r = requests.post(self.TOKEN_URL,
+                                  headers={"Authorization": f"Basic {self._b64_creds()}",
+                                           "Content-Type": "application/x-www-form-urlencoded"},
+                                  data={"grant_type": "authorization_code", "code": auth_code[0],
+                                        "redirect_uri": self.REDIRECT_URI}, timeout=10)
+            d = r.json()
+            self._access_token = d.get("access_token")
+            self._token_expiry = time.time() + d.get("expires_in", 3600)
+            config["spotify_refresh_token"] = d.get("refresh_token", "")
+            save_config(config)
+            return "✅ Spotify connected! You can now ask me to play any song."
+        except Exception as e:
+            return f"❌ Token exchange failed: {e}"
+
+    # ── Playback ──────────────────────────────────────────────────────────────
+    def _get_devices(self) -> list:
+        r = self._api("get", "/me/player/devices")
+        return r.json().get("devices", []) if r and r.status_code == 200 else []
+
+    def _is_desktop_app(self, d: dict) -> bool:
+        """True if this device is the local Spotify desktop app (not web player)."""
+        name = d.get("name", "").lower()
+        return (d.get("type") == "Computer"
+                and "web" not in name
+                and "browser" not in name
+                and not d.get("is_restricted", False))
+
+    def _best_device(self, devices: list) -> str | None:
+        """Prefer desktop app > any active > any computer > first available."""
+        if not devices:
+            return None
+        for d in devices:                          # desktop app first
+            if self._is_desktop_app(d):
+                return d["id"]
+        for d in devices:                          # any active (includes web player)
+            if d.get("is_active"):
+                return d["id"]
+        for d in devices:                          # any computer
+            if d.get("type") == "Computer":
+                return d["id"]
+        return devices[0]["id"]
+
+    def _has_desktop_device(self, devices: list) -> bool:
+        return any(self._is_desktop_app(d) for d in devices)
+
+    def _transfer_to(self, device_id: str) -> None:
+        """Move playback to device_id without starting it."""
+        self._api("put", "/me/player", json={"device_ids": [device_id], "play": False})
+
+    def search_and_play(self, query: str) -> str | None:
+        import re
+        if not self.token():
+            return None
+
+        m = re.search(r'^(.+?)\s+by\s+(.+?)\.?\s*$', query, re.IGNORECASE)
+        track_q  = m.group(1).strip().strip('"\'') if m else None
+        artist_q = m.group(2).strip().strip('"\'') if m else None
+
+        # Try progressively broader searches until one returns a result
+        candidates = []
+        if track_q and artist_q:
+            candidates.append(f'track:"{track_q}" artist:"{artist_q}"')  # exact
+            candidates.append(f'{track_q} {artist_q}')                   # loose, tolerates slight STT errors
+            candidates.append(f'track:"{track_q}"')                       # track-only fallback
+        candidates.append(query)                                           # raw query last
+
+        items = []
+        for search_q in candidates:
+            r = self._api("get", "/search", params={"q": search_q, "type": "track", "limit": 1})
+            if not r:
+                return None
+            items = r.json().get("tracks", {}).get("items", [])
+            if items:
+                break
+
+        if not items:
+            return f"❌ No Spotify results for: {query}"
+        track  = items[0]
+        uri    = track["uri"]
+        name   = track["name"]
+        artist = track["artists"][0]["name"]
+
+        # Prefer desktop app — avoids web player browser autoplay blocking
+        devices = self._get_devices()
+        if not self._has_desktop_device(devices):
+            # No desktop app — launch it and wait up to 8 s for it to register
+            print("[Spotify] No desktop device found — launching Spotify app...")
+            spotify_engine._launch_app()
+            for _ in range(8):
+                time.sleep(1)
+                devices = self._get_devices()
+                if self._has_desktop_device(devices):
+                    break
+
+        device_id = self._best_device(devices)
+        if not device_id:
+            return ("❌ No Spotify device found. Open the Spotify desktop app and "
+                    "press play once, then try again.")
+
+        # Transfer playback to the chosen device first
+        self._transfer_to(device_id)
+        time.sleep(0.6)
+
+        pr = self._api("put", "/me/player/play",
+                       params={"device_id": device_id}, json={"uris": [uri]})
+        if pr is not None and pr.status_code in (200, 204):
+            return f"Now playing: {name} by {artist}"
+        if pr is not None and pr.status_code == 403:
+            return "❌ Spotify Premium is required for API playback control."
+        if pr is not None and pr.status_code == 404:
+            return ("❌ Device went inactive. Open Spotify, press play once, then ask me again.")
+        return None
+
+    def set_volume(self, percent: int) -> str | None:
+        r = self._api("put", "/me/player/volume",
+                      params={"volume_percent": max(0, min(100, percent))})
+        if r and r.status_code in (200, 204):
+            return f"🔊 Spotify volume set to {percent}%"
+        return None
+
+    def seek(self, position_ms: int) -> str | None:
+        r = self._api("put", "/me/player/seek", params={"position_ms": max(0, position_ms)})
+        if r and r.status_code in (200, 204):
+            secs = position_ms // 1000
+            return f"⏩ Jumped to {secs // 60}:{secs % 60:02d}."
+        return None
+
+    def control(self, action: str) -> str | None:
+        if not self.token():
+            return None
+        routes = {"play":     ("put",  "/me/player/play",     "▶ Playing."),
+                  "pause":    ("put",  "/me/player/pause",    "⏸ Paused."),
+                  "next":     ("post", "/me/player/next",     "⏭ Next track."),
+                  "previous": ("post", "/me/player/previous", "⏮ Previous track.")}
+        if action not in routes:
+            return None
+        method, path, label = routes[action]
+        r = self._api(method, path, json={})
+        return label if r is not None and r.status_code in (200, 204) else None
+
+    def now_playing(self) -> str:
+        r = self._api("get", "/me/player/currently-playing")
+        if not r or r.status_code == 204:
+            return "🎵 Nothing is playing right now."
+        item = r.json().get("item")
+        if not item:
+            return "🎵 Nothing is playing right now."
+        name   = item["name"]
+        artist = ", ".join(a["name"] for a in item["artists"])
+        return f"🎵 Now playing: {name} — {artist}"
+
+    def not_authorized_msg(self) -> str:
+        return '❌ Spotify not connected. Say "connect Spotify" to log in with your Spotify account.'
+
+spotify_api = SpotifyAPI()
+
+# -- Spotify Engine -----------------------------------------------------------
+class SpotifyEngine:
+    """Control Spotify via Windows media keys + web player browser automation."""
+
+    # Windows virtual-key codes for media keys
+    _VK_PLAY_PAUSE = 0xB3
+    _VK_NEXT       = 0xB0
+    _VK_PREV       = 0xB1
+    _VK_STOP       = 0xB2
+    _KEYUP         = 0x02
+
+    def _media_key(self, vk: int) -> None:
+        import ctypes
+        ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(vk, 0, self._KEYUP, 0)
+
+    def _is_running(self) -> bool:
+        try:
+            import psutil
+            return any("spotify" in p.name().lower()
+                       for p in psutil.process_iter(["name"]))
+        except Exception:
+            return False
+
+    def _launch_app(self) -> bool:
+        """Try to launch the Spotify desktop app. Returns True if launched."""
+        import os
+        candidates = [
+            Path(os.environ.get("APPDATA", "")) / "Spotify" / "Spotify.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WindowsApps" / "Spotify.exe",
+        ]
+        for path in candidates:
+            if path.exists():
+                try:
+                    subprocess.Popen([str(path)], creationflags=subprocess.DETACHED_PROCESS)
+                    return True
+                except Exception:
+                    pass
+        # Try Windows shell open (works for Store version)
+        try:
+            subprocess.Popen(
+                'explorer "shell:AppsFolder\\SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"',
+                shell=True)
+            return True
+        except Exception:
+            return False
+
+    def open(self) -> str:
+        if self._is_running():
+            return "🎵 Spotify is already running."
+        if self._launch_app():
+            time.sleep(3)
+            return "🎵 Spotify opened."
+        # Fall back to web player
+        run_browser_action("browse_navigate", {"url": "https://open.spotify.com"})
+        return "🎵 Opened Spotify Web Player in browser."
+
+    def play(self) -> str:
+        return spotify_api.control("play") or (self._media_key(self._VK_PLAY_PAUSE) or "▶ Playing.")
+
+    def pause(self) -> str:
+        return spotify_api.control("pause") or (self._media_key(self._VK_PLAY_PAUSE) or "⏸ Paused.")
+
+    def next_track(self) -> str:
+        return spotify_api.control("next") or (self._media_key(self._VK_NEXT) or "⏭ Next track.")
+
+    def prev_track(self) -> str:
+        return spotify_api.control("previous") or (self._media_key(self._VK_PREV) or "⏮ Previous track.")
+
+    def _search_play_impl(self, query: str) -> str:
+        """Runs entirely inside the browser worker thread."""
+        from urllib.parse import quote
+        page = browser_agent._page
+        if page is None or page.is_closed():
+            browser_agent._ensure()
+            page = browser_agent._page
+
+        url = f"https://open.spotify.com/search/{quote(query)}/tracks"
+        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+
+        # Wait for track list to appear
+        try:
+            page.wait_for_selector('[data-testid="tracklist-row"]', timeout=15000)
+        except Exception:
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
+        # Hover over first row to reveal its play button, then click it
+        try:
+            rows = page.locator('[data-testid="tracklist-row"]')
+            first = rows.first
+            first.scroll_into_view_if_needed()
+            first.hover()
+            time.sleep(0.4)
+            # Try the dedicated play button first
+            play_btn = first.locator('[data-testid="tracklist-play-pause-button"]').first
+            if play_btn.is_visible(timeout=2000):
+                play_btn.click()
+                return f"🎵 Playing: {query}"
+            # Fall back: double-click the row itself
+            first.dblclick()
+            return f"🎵 Playing: {query}"
+        except Exception as e:
+            return f"🎵 Opened Spotify search for: {query} (click a result to play) — {e}"
+
+    def search_and_play(self, query: str) -> str:
+        if not spotify_api.ready():
+            return ("❌ Spotify credentials not set up. Open Settings → Spotify, "
+                    "enter your Client ID and Secret, then click 'Connect / Re-authorize'.")
+        # No token yet — run OAuth flow now (blocks until user clicks Allow in browser)
+        if not spotify_api.token():
+            auth = spotify_api.authorize()
+            if "✅" not in auth:
+                return auth  # auth failed or timed out
+        # Use the Web API to search and play
+        result = spotify_api.search_and_play(query)
+        if result is not None:
+            return result
+        return ("❌ Could not start playback. Make sure the Spotify app is open "
+                "and you've played something in it at least once this session.")
+
+    def _like_impl(self) -> str:
+        page = browser_agent._page
+        if not page or page.is_closed():
+            return "❌ Spotify web player not open."
+        try:
+            btn = page.locator('[aria-label*="Save to Your Liked Songs"]').first
+            btn.click(timeout=4000)
+            return "💚 Liked the current track."
+        except Exception:
+            return "❌ Could not find the Like button — make sure something is playing in the web player."
+
+    def like_current(self) -> str:
+        return browser_agent.execute(self._like_impl)
+
+    def _now_playing_impl(self) -> str:
+        page = browser_agent._page
+        if not page or page.is_closed():
+            return "🎵 Spotify web player not open."
+        try:
+            return page.evaluate("""() => {
+                const title  = document.querySelector('[data-testid="context-item-link"]');
+                const artist = document.querySelector('[data-testid="context-item-info-artist"]');
+                if (!title) return '';
+                return (title ? title.innerText : '') + (artist ? ' — ' + artist.innerText : '');
+            }""") or "🎵 Nothing playing right now."
+        except Exception:
+            return "🎵 Could not read now-playing info."
+
+    def get_now_playing(self) -> str:
+        if spotify_api.token():
+            return spotify_api.now_playing()
+        try:
+            info = browser_agent.execute(self._now_playing_impl)
+            return f"🎵 Now playing: {info}" if info and "Nothing" not in info else info
+        except Exception:
+            return "🎵 Could not read now-playing info."
+
+spotify_engine = SpotifyEngine()
+
+# -- Calendar Manager (Google Calendar + Apple iCloud via CalDAV) --------------
+
+def _cal_parse_dt(date_str: str, time_str: str):
+    """Parse natural-language date/time into a naive datetime in local time."""
+    from datetime import datetime, timedelta, time as _time
+    import re as _re
+
+    combined = (date_str + " " + time_str).strip().lower()
+    now  = datetime.now()
+    today = now.date()
+
+    _weekdays = {
+        "monday": 0, "mon": 0, "tuesday": 1, "tue": 1,
+        "wednesday": 2, "wed": 2, "thursday": 3, "thu": 3,
+        "friday": 4, "fri": 4, "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+    }
+
+    d = None
+    if "today" in combined:
+        d = today
+    elif "tomorrow" in combined:
+        d = today + timedelta(days=1)
+    else:
+        for word, wd in _weekdays.items():
+            if word in combined:
+                ahead = (wd - today.weekday()) % 7 or 7
+                d = today + timedelta(days=ahead)
+                break
+    if d is None:
+        # Strip ordinal suffixes ("27th" → "27", "1st" → "1") before strptime
+        date_clean = _re.sub(r'(\d+)(?:st|nd|rd|th)\b', r'\1', date_str.strip())
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y",
+                    "%B %d %Y", "%b %d %Y", "%B %d", "%b %d"):
+            try:
+                parsed = datetime.strptime(date_clean, fmt)
+                d = parsed.date()
+                if d.year == 1900:
+                    d = d.replace(year=today.year)
+                break
+            except ValueError:
+                continue
+    if d is None:
+        d = today
+
+    t = None
+    if time_str.strip():
+        for fmt in ("%I:%M %p", "%I:%M%p", "%H:%M", "%I %p", "%I%p"):
+            try:
+                t = datetime.strptime(time_str.strip(), fmt).time()
+                break
+            except ValueError:
+                continue
+    if t is None:
+        m = _re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)', combined, _re.I)
+        if m:
+            hour   = int(m.group(1))
+            minute = int(m.group(2) or 0)
+            if m.group(3).lower() == "pm" and hour != 12:
+                hour += 12
+            elif m.group(3).lower() == "am" and hour == 12:
+                hour = 0
+            t = _time(hour, minute)
+
+    return datetime.combine(d, t if t else datetime.min.time())
+
+
+def _cal_local_tz():
+    """Return a timezone object for the local system timezone."""
+    import time as _t
+    from datetime import timezone, timedelta
+    # Use altzone only when DST is actually in effect right now, not just defined
+    in_dst = _t.daylight and _t.localtime().tm_isdst
+    offset_sec = -(_t.altzone if in_dst else _t.timezone)
+    return timezone(timedelta(seconds=offset_sec))
+
+
+def _parse_cal_add(text: str) -> dict:
+    """
+    Parse natural-language event creation into keyword args for CalendarManager.add_event.
+    Handles patterns like:
+      "add Shakira Day from 5pm to 8pm on June 27th"
+      "schedule dentist appointment tomorrow at 2pm for 45 minutes"
+      "put team meeting on Friday at 10am on both calendars"
+    """
+    import re as _re
+
+    tl = text.strip()
+
+    # Calendar target
+    calendar = ("both"  if _re.search(r'\bboth\b', tl, _re.I) else
+                "apple" if _re.search(r'\b(apple|icloud)\b', tl, _re.I) else "google")
+
+    # ── Time ──────────────────────────────────────────────────────────────────
+    # "from Xpm to Ypm" or "from X to Y pm"
+    tr = _re.search(
+        r'from\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s+to\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))',
+        tl, _re.I)
+    # "X-Ypm" or "X–Ypm" (dash/en-dash range, e.g. "5-8PM")
+    tr_dash = None if tr else _re.search(
+        r'(\d{1,2}(?::\d{2})?)\s*[-–]\s*(\d{1,2}(?::\d{2})?)\s*(am|pm)',
+        tl, _re.I)
+    at = _re.search(r'\bat\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))', tl, _re.I)
+
+    start_time = ""
+    duration   = 60
+
+    def _parse_range(raw_s, raw_e):
+        nonlocal start_time, duration
+        if not _re.search(r'am|pm', raw_s, _re.I):
+            ampm = _re.search(r'(am|pm)', raw_e, _re.I)
+            if ampm:
+                raw_s += " " + ampm.group(1)
+        start_time = raw_s
+        try:
+            s = _cal_parse_dt("today", raw_s)
+            e = _cal_parse_dt("today", raw_e)
+            duration = max(15, int((e - s).total_seconds() / 60))
+        except Exception:
+            pass
+
+    if tr:
+        _parse_range(tr.group(1).strip(), tr.group(2).strip())
+    elif tr_dash:
+        # "5-8PM" → start="5 PM", end="8 PM"
+        ampm = tr_dash.group(3)
+        _parse_range(tr_dash.group(1).strip() + " " + ampm,
+                     tr_dash.group(2).strip() + " " + ampm)
+    elif at:
+        start_time = at.group(1).strip()
+
+    # "for X hours / X minutes" overrides duration when no time range given
+    dur_m = _re.search(r'for\s+(\d+(?:\.\d+)?)\s*(hour|hr|minute|min)s?', tl, _re.I)
+    if dur_m and not tr:
+        val  = float(dur_m.group(1))
+        unit = dur_m.group(2).lower()
+        duration = int(val * 60) if unit in ("hour", "hr") else int(val)
+
+    # ── Date ──────────────────────────────────────────────────────────────────
+    _MONTHS = (r'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
+               r'jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?')
+    _DAYS   = r'monday|tuesday|wednesday|thursday|friday|saturday|sunday'
+    date_str = "today"
+    for pat in [
+        rf'on\s+((?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s+\d{{4}})?)',
+        rf'\b((?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s+\d{{4}})?)\b',
+        rf'\b(next\s+(?:{_DAYS}))\b',
+        rf'\b({_DAYS})\b',
+        r'\b(tomorrow|today)\b',
+    ]:
+        m = _re.search(pat, tl, _re.I)
+        if m:
+            date_str = m.group(1).strip()
+            break
+
+    # ── Title ─────────────────────────────────────────────────────────────────
+    _VERBS      = r'add|schedule|put|create|book|mark|set|note|log'
+    _DAY_TRAILER = rf'(?:\s+(?:next\s+)?(?:{_DAYS}|today|tomorrow))+\s*$'
+
+    # Pattern A: verb [title] before time/date/calendar keyword
+    title_m = _re.search(
+        rf'(?:(?:^|,\s*)(?:please\s+)?)(?:{_VERBS})\s+(.+?)\s+'
+        r'(?:from\s+\d|at\s+\d|\d{{1,2}}[-–]\d{{1,2}}\s*(?:am|pm)|'
+        rf'\bon\s+(?:{_MONTHS}|{_DAYS}|today|tomorrow)|'
+        r'\bto (?:my|the) (?:calendar|schedule))',
+        tl, _re.I)
+
+    # Pattern B: "on [date], [title]" — title comes AFTER the date
+    title_after_date_m = _re.search(
+        rf'on\s+(?:{_MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+([^.]+?)(?:\.\s*\d|\s+\d{{1,2}}[-–\s]|\s*$)',
+        tl, _re.I)
+
+    _raw_a = title_m.group(1).strip().strip(",") if title_m else None
+    # Reject Pattern A if it captured "on/to my calendar" (means title is AFTER the date, not before)
+    if _raw_a and _re.match(r'(?:on|to|in)\s+(?:my\s+)?(?:calendar|schedule)\b', _raw_a, _re.I):
+        _raw_a = None
+    if _raw_a:
+        title = _re.sub(_DAY_TRAILER, '', _raw_a, flags=_re.I).strip()
+        # Strip orphaned trailing prepositions ("for", "the", "a", "an", "of")
+        title = _re.sub(r'\s+(?:for|the|a|an|of)\s*$', '', title, flags=_re.I).strip()
+    elif title_after_date_m:
+        title = title_after_date_m.group(1).strip().strip(",.")
+        title = _re.sub(_DAY_TRAILER, '', title, flags=_re.I).strip()
+    else:
+        # Fallback: strip action verb and trailing date/time/calendar phrases
+        title = _re.sub(
+            rf'^(?:can you\s+)?(?:please\s+)?(?:{_VERBS})\s+', '', tl, flags=_re.I)
+        title = _re.sub(r'\s*(?:to|on|in)\s+(?:my\s+)?(?:calendar|schedule).*$', '', title, flags=_re.I)
+        title = _re.sub(r'\s*from\s+\d.*$', '', title, flags=_re.I)
+        title = _re.sub(r'\s*\d{1,2}[-–]\d{1,2}\s*(?:am|pm).*$', '', title, flags=_re.I)
+        title = _re.sub(r'\s*at\s+\d.*$', '', title, flags=_re.I)
+        title = _re.sub(
+            rf'\s*on\s+(?:{_MONTHS}|{_DAYS}|today|tomorrow).*$', '', title, flags=_re.I)
+        title = _re.sub(_DAY_TRAILER, '', title, flags=_re.I).strip().strip("?,.")
+
+    if not title or len(title) < 2:
+        title = "New Event"
+
+    return {"title": title, "date_str": date_str, "time_str": start_time,
+            "duration_min": duration, "calendar": calendar}
+
+
+class CalendarManager:
+    GOOGLE_SCOPES     = ["https://www.googleapis.com/auth/calendar"]
+    GOOGLE_TOKEN_FILE = Path.home() / ".ai_assistant_gcal_token.json"
+    ICLOUD_CALDAV_URL = "https://caldav.icloud.com"
+
+    def __init__(self):
+        self._gcal_service = None
+
+    # ── internal helpers ───────────────────────────────────────────────────────
+
+    def _gcal_creds_path(self) -> str:
+        return config.get("google_calendar_credentials_path", "").strip()
+
+    def _gcal_ready(self) -> bool:
+        return bool(self._gcal_creds_path() and self.GOOGLE_TOKEN_FILE.exists())
+
+    def _apple_ready(self) -> bool:
+        return bool(config.get("icloud_calendar_user", "").strip() and
+                    config.get("icloud_calendar_password", "").strip())
+
+    def _get_gcal_service(self):
+        """Return (service, error_str). Refreshes expired token automatically."""
+        try:
+            from google.oauth2.credentials import Credentials
+            from google.auth.transport.requests import Request as _GReq
+            from googleapiclient.discovery import build
+        except ImportError:
+            return None, "Google API packages not installed. Say 'connect Google Calendar' first."
+
+        creds = None
+        if self.GOOGLE_TOKEN_FILE.exists():
+            try:
+                creds = Credentials.from_authorized_user_file(
+                    str(self.GOOGLE_TOKEN_FILE), self.GOOGLE_SCOPES)
+            except Exception:
+                pass
+
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(_GReq())
+                self.GOOGLE_TOKEN_FILE.write_text(creds.to_json())
+            except Exception:
+                creds = None
+
+        if not creds or not creds.valid:
+            return None, "Google Calendar not connected. Say 'connect Google Calendar' to authorize."
+
+        try:
+            svc = build("calendar", "v3", credentials=creds)
+            return svc, None
+        except Exception as e:
+            return None, str(e)
+
+    def _get_caldav_cals(self):
+        """Return (calendars_list, error_str). Either one may be None."""
+        if not self._apple_ready():
+            return None, "iCloud credentials not configured. Add them in Settings → Apple Calendar."
+        try:
+            import caldav
+        except ImportError:
+            return None, "caldav package not installed. Say 'connect Apple Calendar' first."
+        try:
+            client = caldav.DAVClient(
+                url=self.ICLOUD_CALDAV_URL,
+                username=config.get("icloud_calendar_user", ""),
+                password=config.get("icloud_calendar_password", ""),
+            )
+            cals = client.principal().calendars()
+            return cals, None
+        except Exception as e:
+            return None, str(e)
+
+    def _tz_aware(self, dt):
+        """Return dt with local timezone attached (naive → aware)."""
+        from datetime import datetime
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_cal_local_tz())
+        return dt
+
+    # ── public API ─────────────────────────────────────────────────────────────
+
+    def google_authorize(self) -> str:
+        path = self._gcal_creds_path()
+        if not path or not Path(path).exists():
+            return ("❌ No credentials file found. Download your OAuth credentials JSON from "
+                    "console.cloud.google.com → APIs & Services → Credentials, "
+                    "then set the path in Settings → Google Calendar.")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                            "google-api-python-client", "google-auth-httplib2",
+                            "google-auth-oauthlib"], check=True)
+            from google_auth_oauthlib.flow import InstalledAppFlow
+        except Exception as e:
+            return f"❌ Failed to install Google API packages: {e}"
+        try:
+            flow  = InstalledAppFlow.from_client_secrets_file(path, self.GOOGLE_SCOPES)
+            creds = flow.run_local_server(
+                port=8181, prompt="consent",
+                success_message="Jarvis is now connected to Google Calendar. You may close this tab.")
+            self.GOOGLE_TOKEN_FILE.write_text(creds.to_json())
+            self._gcal_service = None
+            return "✅ Google Calendar connected! You can now add and view events."
+        except Exception as e:
+            return f"❌ Google Calendar auth failed: {e}"
+
+    def apple_connect(self) -> str:
+        if not self._apple_ready():
+            return "❌ Enter your Apple ID and App-Specific Password in Settings → Apple Calendar first."
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                            "caldav", "icalendar"], check=True)
+        except Exception as e:
+            return f"❌ Failed to install caldav/icalendar: {e}"
+        cals, err = self._get_caldav_cals()
+        if err:
+            return f"❌ iCloud Calendar connection failed: {err}"
+        def _cal_display_name(c):
+            try: return c.get_display_name()
+            except Exception: return getattr(c, "name", "?")
+        names = [_cal_display_name(c) for c in (cals or [])]
+        return f"✅ Apple Calendar connected! Found {len(names)} calendar(s): {', '.join(names[:6])}"
+
+    def status(self) -> str:
+        lines = []
+        if self._gcal_ready():
+            svc, err = self._get_gcal_service()
+            lines.append("📅 Google Calendar: " + ("✅ Connected" if svc else f"⚠️ {err}"))
+        else:
+            lines.append("📅 Google Calendar: ❌ Not connected")
+        if self._apple_ready():
+            cals, err = self._get_caldav_cals()
+            lines.append("🍎 Apple Calendar: " + (
+                f"✅ Connected ({len(cals)} calendar(s))" if cals else f"⚠️ {err}"))
+        else:
+            lines.append("🍎 Apple Calendar: ❌ Not connected")
+        return "\n".join(lines)
+
+    def add_event(self, title: str, date_str: str, time_str: str = "",
+                  duration_min: int = 60, notes: str = "",
+                  calendar: str = "google") -> str:
+        from datetime import timedelta
+        try:
+            dt = _cal_parse_dt(date_str, time_str)
+        except Exception as e:
+            return f"❌ Couldn't parse date/time '{date_str} {time_str}': {e}"
+
+        all_day = not time_str.strip()
+        results = []
+
+        if calendar in ("google", "both"):
+            svc, err = self._get_gcal_service()
+            if err:
+                results.append(f"⚠️ Google Calendar: {err}")
+            else:
+                try:
+                    if all_day:
+                        body = {
+                            "summary": title,
+                            "description": notes,
+                            "start": {"date": dt.strftime("%Y-%m-%d")},
+                            "end":   {"date": (dt + timedelta(days=1)).strftime("%Y-%m-%d")},
+                        }
+                    else:
+                        dt_aware  = self._tz_aware(dt)
+                        end_aware = dt_aware + timedelta(minutes=duration_min)
+                        body = {
+                            "summary":     title,
+                            "description": notes,
+                            "start": {"dateTime": dt_aware.isoformat()},
+                            "end":   {"dateTime": end_aware.isoformat()},
+                        }
+                    svc.events().insert(calendarId="primary", body=body).execute()
+                    label = dt.strftime("%b %d at %I:%M %p") if not all_day else dt.strftime("%b %d")
+                    results.append(f"✅ Google Calendar: '{title}' added on {label}.")
+                except Exception as e:
+                    results.append(f"❌ Google Calendar error: {e}")
+
+        if calendar in ("apple", "both"):
+            cals, err = self._get_caldav_cals()
+            if err:
+                results.append(f"⚠️ Apple Calendar: {err}")
+            else:
+                try:
+                    import caldav  # noqa: F401
+                    from icalendar import Calendar as _iCal, Event as _iEv
+                    import uuid
+                    cal_obj = cals[0] if cals else None
+                    if not cal_obj:
+                        results.append("⚠️ No iCloud calendars found.")
+                    else:
+                        end_dt = dt + timedelta(minutes=duration_min if not all_day else 1440)
+                        ical = _iCal()
+                        ical.add("prodid", "-//Jarvis AI//EN")
+                        ical.add("version", "2.0")
+                        ev = _iEv()
+                        ev.add("uid", str(uuid.uuid4()))
+                        ev.add("summary", title)
+                        if notes:
+                            ev.add("description", notes)
+                        if all_day:
+                            ev.add("dtstart", dt.date())
+                            ev.add("dtend", end_dt.date())
+                        else:
+                            ev.add("dtstart", self._tz_aware(dt))
+                            ev.add("dtend", self._tz_aware(end_dt))
+                        ical.add_component(ev)
+                        cal_obj.save_event(ical.to_ical().decode())
+                        label = dt.strftime("%b %d at %I:%M %p") if not all_day else dt.strftime("%b %d")
+                        results.append(f"✅ Apple Calendar: '{title}' added on {label}.")
+                except Exception as e:
+                    results.append(f"❌ Apple Calendar error: {e}")
+
+        return "\n".join(results) if results else "❌ No calendar specified."
+
+    def list_events(self, period: str = "today", calendar: str = "all") -> str:
+        from datetime import datetime, timedelta
+        today = datetime.now().date()
+        p = period.strip().lower()
+
+        if p == "today":
+            start = datetime.combine(today, datetime.min.time())
+            end   = datetime.combine(today, datetime.max.time())
+            label = "Today"
+        elif p == "tomorrow":
+            d = today + timedelta(days=1)
+            start = datetime.combine(d, datetime.min.time())
+            end   = datetime.combine(d, datetime.max.time())
+            label = "Tomorrow"
+        elif p in ("week", "this week", "this_week"):
+            start = datetime.combine(today, datetime.min.time())
+            end   = datetime.combine(today + timedelta(days=7), datetime.max.time())
+            label = "Next 7 days"
+        else:
+            try:
+                parsed = _cal_parse_dt(p, "")
+                start  = datetime.combine(parsed.date(), datetime.min.time())
+                end    = datetime.combine(parsed.date(), datetime.max.time())
+                label  = parsed.strftime("%B %d")
+            except Exception:
+                start = datetime.combine(today, datetime.min.time())
+                end   = datetime.combine(today + timedelta(days=7), datetime.max.time())
+                label = "Next 7 days"
+
+        events = []
+
+        if calendar in ("google", "all"):
+            svc, err = self._get_gcal_service()
+            if err and "Not connected" not in err:
+                events.append(f"⚠️ Google: {err}")
+            elif svc:
+                try:
+                    result = svc.events().list(
+                        calendarId="primary",
+                        timeMin=self._tz_aware(start).isoformat(),
+                        timeMax=self._tz_aware(end).isoformat(),
+                        singleEvents=True, orderBy="startTime", maxResults=20
+                    ).execute()
+                    for e in result.get("items", []):
+                        s       = e.get("start", {})
+                        t_raw   = s.get("dateTime", s.get("date", ""))
+                        summary = e.get("summary", "(no title)")
+                        if "T" in t_raw:
+                            from datetime import datetime as _dt2
+                            tstr = _dt2.fromisoformat(t_raw).astimezone().strftime("%I:%M %p")
+                        else:
+                            tstr = "All day"
+                        events.append(f"📅 [Google] {summary} — {tstr}")
+                except Exception as e:
+                    events.append(f"⚠️ Google error: {e}")
+
+        if calendar in ("apple", "all"):
+            cals, err = self._get_caldav_cals()
+            if err and "Not configured" not in err:
+                events.append(f"⚠️ Apple: {err}")
+            elif cals:
+                try:
+                    for c in cals:
+                        try:
+                            for evt in c.search(start=start, end=end, expand=True):
+                                comp    = evt.icalendar_component
+                                summary = str(comp.get("SUMMARY", "(no title)"))
+                                dts     = comp.get("DTSTART")
+                                tstr    = (dts.dt.strftime("%I:%M %p")
+                                           if dts and hasattr(dts.dt, "hour") else "All day")
+                                events.append(f"🍎 [Apple] {summary} — {tstr}")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    events.append(f"⚠️ Apple error: {e}")
+
+        if not events:
+            return f"No events found for {label}."
+        return f"📆 {label}:\n" + "\n".join(events)
+
+    def delete_event(self, query: str, calendar: str = "google") -> str:
+        from datetime import datetime, timedelta
+        now = datetime.now()
+
+        if calendar in ("google", "all"):
+            svc, err = self._get_gcal_service()
+            if err:
+                return f"⚠️ Google Calendar: {err}"
+            try:
+                result = svc.events().list(
+                    calendarId="primary",
+                    timeMin=self._tz_aware(now).isoformat(),
+                    timeMax=self._tz_aware(now + timedelta(days=30)).isoformat(),
+                    singleEvents=True, orderBy="startTime", q=query, maxResults=5
+                ).execute()
+                items = result.get("items", [])
+                if not items:
+                    return f"❌ No upcoming events matching '{query}'."
+                evt = items[0]
+                svc.events().delete(calendarId="primary", eventId=evt["id"]).execute()
+                return f"✅ Deleted: '{evt.get('summary', query)}'"
+            except Exception as e:
+                return f"❌ Delete failed: {e}"
+        return "❌ Only Google Calendar delete is supported. Specify calendar='google'."
+
+    def upcoming_brief(self) -> str:
+        """One-line summary of today's events for AI context injection."""
+        try:
+            result = self.list_events("today", "all")
+            if "No events" in result:
+                return ""
+            lines = [l.strip() for l in result.split("\n")[1:] if l.strip()]
+            parts = []
+            for l in lines:
+                segs = l.split("—")
+                if len(segs) >= 2:
+                    name = segs[0].split("]")[-1].strip()
+                    time = segs[1].strip()
+                    parts.append(f"{name} at {time}")
+            return ("Today's calendar: " + ", ".join(parts)) if parts else ""
+        except Exception:
+            return ""
+
+
+calendar_manager = CalendarManager()
 
 # -- Screen Observer (Deep Think / Proactive Mode) ---------------------------
 
@@ -2215,15 +3761,25 @@ def _screenshot_b64() -> str:
     except Exception:
         return ""
 
+_vision_host_map: dict = {}   # model_name -> host that has it
+
 def _detect_vision_model() -> str:
-    try:
-        r = requests.get(f"http://{_ollama_host}:11434/api/tags", timeout=3)
-        for m in r.json().get("models", []):
-            name = m.get("name", "")
-            if any(vm in name for vm in ("llava", "moondream", "minicpm", "bakllava")):
-                return name
-    except Exception:
-        pass
+    """Search for a vision model, preferring background hosts so vision never
+    competes with the primary host's user-facing LLM requests."""
+    _VISION_TAGS = ("llava", "moondream", "minicpm", "bakllava")
+    # Background hosts first, then primary as fallback
+    bg   = _active_hosts[1:] if len(_active_hosts) > 1 else []
+    prim = _active_hosts[:1] if _active_hosts else [_ollama_host]
+    for host in bg + prim:
+        try:
+            r = requests.get(_ollama_base_url(host) + "/api/tags", timeout=3)
+            for m in r.json().get("models", []):
+                name = m.get("name", "")
+                if any(t in name for t in _VISION_TAGS):
+                    _vision_host_map[name] = host
+                    return name
+        except Exception:
+            pass
     return ""
 
 _VISION_BACKGROUND_Q = (
@@ -2237,27 +3793,68 @@ _VISION_DETAIL_Q = (
     "any error messages, UI elements, and what the user is doing."
 )
 
-def _ask_vision(b64: str, model: str, question: str = _VISION_BACKGROUND_Q, max_tokens: int = 300) -> str:
+def _shrink_b64_for_model(b64: str, model: str) -> str:
+    """Resize image to a smaller resolution for lightweight models like moondream."""
+    if "moondream" not in model.lower():
+        return b64
     try:
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": question, "images": [b64]}],
-            "stream": False,
-            "options": {"temperature": 0.1, "num_predict": max_tokens},
-        }
-        print(f"[Vision] Asking {model}...")
-        r = requests.post(OLLAMA_URL, json=payload, timeout=90)
-        data = r.json()
-        content = data.get("message", {}).get("content", "").strip()
-        if not content:
-            err = data.get("error", "")
-            print(f"[Vision] Empty response. Error: {err!r}  Full: {str(data)[:200]}")
-        else:
+        from PIL import Image as _PI
+        raw = base64.b64decode(b64)
+        img = _PI.open(BytesIO(raw)).convert("RGB")
+        img.thumbnail((640, 640))
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=70)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return b64
+
+# Only one vision inference at a time — prevents GPU pile-up when timeouts occur
+_vision_sem = threading.Semaphore(1)
+
+def _ask_vision(b64: str, model: str, question: str = _VISION_BACKGROUND_Q, max_tokens: int = 300) -> str:
+    # Prefer background host; use cached detection result if available
+    host     = _vision_host_map.get(model, _bg_host())
+    base_url = _ollama_base_url(host)
+    chat_url = base_url + "/api/chat"
+    gen_url  = base_url + "/api/generate"
+
+    is_moondream = "moondream" in model.lower()
+    q  = "Describe everything visible in this image in detail." if is_moondream else question
+    b64 = _shrink_b64_for_model(b64, model)
+
+    # Bail immediately if another vision call is already in flight
+    if not _vision_sem.acquire(blocking=False):
+        return ""
+    try:
+        def _chat(prompt: str) -> str:
+            payload = {"model": model, "stream": False,
+                       "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+                       "options": {"temperature": 0.1, "num_predict": max_tokens}}
+            r = requests.post(chat_url, json=payload, timeout=90)
+            return r.json().get("message", {}).get("content", "").strip()
+
+        def _generate(prompt: str) -> str:
+            payload = {"model": model, "prompt": prompt, "images": [b64], "stream": False,
+                       "options": {"temperature": 0.1, "num_predict": max_tokens}}
+            r = requests.post(gen_url, json=payload, timeout=90)
+            return r.json().get("response", "").strip()
+
+        print(f"[Vision] Asking {model} on {host}...")
+        content = _chat(q)
+        if not content and is_moondream:
+            content = _generate(q)
+        if not content and is_moondream:
+            content = _generate("What is shown in this image?")
+        if content:
             print(f"[Vision] {len(content)} chars received.")
+        else:
+            print(f"[Vision] ❌ Vision model returned no description.")
         return content
     except Exception as e:
         print(f"[Vision] ❌ {e}")
         return ""
+    finally:
+        _vision_sem.release()
 
 class ScreenObserver:
     INTERVAL = 5  # seconds between captures
@@ -2267,6 +3864,7 @@ class ScreenObserver:
         self._thread = None
         self._vision_model = ""
         self._observations: list = []
+        self._capturing = False     # True while a vision call is in flight
 
     def start(self, app_ref):
         if self.active:
@@ -2293,7 +3891,11 @@ class ScreenObserver:
         if self._vision_model:
             b64 = _screenshot_b64()
             if b64:
-                desc = _ask_vision(b64, self._vision_model)
+                self._capturing = True
+                try:
+                    desc = _ask_vision(b64, self._vision_model)
+                finally:
+                    self._capturing = False
                 if desc:
                     parts.append(f"Screen: {desc}")
         else:
@@ -2341,6 +3943,9 @@ class ScreenObserver:
     def _loop(self, app_ref):
         tick = 0
         while self.active:
+            if self._capturing:          # previous vision call still running — skip tick
+                time.sleep(self.INTERVAL)
+                continue
             obs = self._capture()
             if obs:
                 self._observations.append(obs)
@@ -2369,7 +3974,8 @@ class ScreenObserver:
                 "stream": False,
                 "options": {"temperature": 0.3, "num_predict": 200},
             }
-            r = requests.post(OLLAMA_URL, json=payload, timeout=20)
+            _bg_url = _ollama_base_url(_bg_host()) + "/api/chat"
+            r = requests.post(_bg_url, json=payload, timeout=20)
             thought = r.json().get("message", {}).get("content", "").strip()
             if thought and thought != "." and len(thought) > 8:
                 if app_ref:
@@ -2416,9 +4022,18 @@ Supported actions:
 - browse_type (Args: "selector", "text") — selector can be "email", "password", "search", "auto", or a CSS selector. Use "auto" to type into the first visible input on the page. Do NOT use this for Google Docs document body.
 - browse_type_cursor (Args: "text") — Type text at the current cursor position using raw keyboard events. Use this INSTEAD of browse_type whenever you are typing inside a document editor body (Google Docs, Word Online, etc.). It types wherever the cursor already is — no element needed.
 - browse_screenshot (Args: "filename")
-- browse_read (Args: none)
+- browse_read (Args: none) — Read the main content of the current page (strips nav/footer noise, returns clean article text up to 6000 chars).
 - browse_key (Args: "key") — Press a keyboard key: "Escape", "Enter", "Tab", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ctrl+z", "ctrl+s", etc.
 - browse_task (Args: "task")
+- browse_scroll (Args: "direction", "amount") — Scroll the page. direction = "down" | "up" | "top" | "bottom". amount = percentage of viewport height (default 60). Use to reveal content below the fold.
+- browse_back (Args: none) — Navigate back in browser history.
+- browse_forward (Args: none) — Navigate forward in browser history.
+- browse_links (Args: none) — List all visible links on the current page with their URLs. Use to find what to click next when reading a page.
+- browse_wait (Args: "target") — Wait for N seconds ("3") or for a CSS selector to appear (".results"). Use after navigating to dynamic pages that load content after the initial HTML.
+- browse_new_tab (Args: "url") — Open a new browser tab, optionally navigating to a URL.
+- browse_tabs (Args: none) — List all open browser tabs with their indices.
+- browse_switch_tab (Args: "index") — Switch to an open tab by its index number (from browse_tabs).
+- browse_close_tab (Args: none) — Close the current tab and switch to the previous one.
 - web_lookup (Args: "query") — Search the web for information. Only use when NOT in offline mode.
 - schedule_task (Args: "description", "interval_minutes") — schedule a task to repeat every N minutes in the background. Use when Schmit says "every X minutes do Y", "remind me to check X", "repeat this task every N minutes".
 - list_tasks (Args: none) — list all currently scheduled background tasks with their IDs and intervals.
@@ -2440,6 +4055,22 @@ Supported actions:
 - camera_identify (Args: none) — identify who is in the webcam frame by comparing to saved faces. Use for "who am I?", "do you know me?", "recognize me".
 - camera_faces_list (Args: none) — list all saved known faces.
 - camera_forget (Args: "name") — delete a saved face by name.
+- spotify_connect (Args: none) — authorize Jarvis to control Spotify via the Web API. Use when Schmit says "connect Spotify", "link Spotify", "authorize Spotify". Only needed once.
+- spotify_open (Args: none) — launch Spotify (desktop app or web player). Use when Schmit says "open Spotify", "start Spotify".
+- spotify_play (Args: none) — resume/play music. Use for "play", "resume", "unpause".
+- spotify_pause (Args: none) — pause music. Use for "pause", "stop music".
+- spotify_next (Args: none) — skip to next track. Use for "next", "skip", "next song".
+- spotify_prev (Args: none) — go back to previous track. Use for "previous", "back", "last song".
+- spotify_search (Args: "query") — search Spotify and play the result. Use for "play [song/artist/playlist] on Spotify", "put on [music]", "play something by [artist]".
+- spotify_now_playing (Args: none) — show what track is currently playing on Spotify.
+- spotify_like (Args: none) — like/save the current track.
+- spotify_seek (Args: "position") — jump to a position in the current track. position can be seconds ("90"), minutes:seconds ("1:30"), or a description ("halfway", "beginning"). Use when Schmit says "skip to 2 minutes", "go to 1:30", "jump to the chorus", "start from the beginning".
+- calendar_status (Args: none) — show which calendars (Google, Apple) are connected. Use when Schmit asks about calendar setup or "is my calendar connected".
+- calendar_connect_google (Args: none) — start Google Calendar OAuth authorization flow. Use when Schmit says "connect Google Calendar", "link Google Calendar", "authorize Google Calendar".
+- calendar_connect_apple (Args: none) — test and connect Apple/iCloud Calendar via CalDAV. Use when Schmit says "connect Apple Calendar", "link iCloud Calendar".
+- calendar_add (Args: "title", "date", "time", "duration_minutes", "notes", "calendar") — add a calendar event. calendar = "google", "apple", or "both" (default "google"). time format: "3:00 PM". duration_minutes defaults to 60. Use for "add a meeting", "schedule X on Tuesday at 2pm", "put X on my calendar", "remind me about X".
+- calendar_list (Args: "period", "calendar") — list calendar events. period = "today", "tomorrow", "week", or a specific date like "June 5". calendar = "all", "google", or "apple" (default "all"). Use for "what's on my calendar?", "what do I have today?", "show my schedule for the week", "what's tomorrow look like?".
+- calendar_delete (Args: "query", "calendar") — delete an upcoming event whose name matches query. calendar = "google" or "apple" (default "google"). Use for "cancel my meeting", "delete the dentist appointment", "remove X from my calendar".
 
 Profile notes: "my profile", "your profile", "profile 19", "eve" all refer to Profile 19 (the main/default profile).
 URL shortcuts: "chatgpt" → https://chat.openai.com, "youtube" → https://www.youtube.com, "google docs" or "docs" → https://docs.google.com, "gmail" → https://mail.google.com, "reddit" → https://www.reddit.com, "google" or "chrome" → https://www.google.com.
@@ -2481,15 +4112,10 @@ Never respond with plain text. Never omit the "action" key.
             }
         )
 
-        if _is_complex(prompt):
-            model = REASON_MODEL
-        elif _is_trivial(prompt):
-            model = CHAT_MODEL
-        else:
-            model = OLLAMA_MODEL
+        model = _choose_model(prompt)
         global _active_model
         _active_model = model
-        print(f"🤖 Model: {model}")
+        print(f"🤖 Model: {model}  ·  Speed: {SPEED_MODE_LABEL.get(_speed_mode, _speed_mode)}")
 
         payload = {
             "model": model,
@@ -2501,21 +4127,50 @@ Never respond with plain text. Never omit the "action" key.
                 "num_gpu": 999,      # force all layers onto VRAM
             },
         }
-        def _call(mdl, timeout_s):
+        def _call(mdl, timeout_s, _url=None):
+            """Single-host inference call. _url overrides OLLAMA_URL."""
             global _inference_response
             payload["model"] = mdl
-            r = requests.post(OLLAMA_URL, json=payload, timeout=timeout_s, stream=True)
+            endpoint = _url or OLLAMA_URL
+            r = requests.post(endpoint, json=payload, timeout=timeout_s, stream=True)
             r.raise_for_status()
             _inference_response = r
+
+            line_q    = queue.Queue()
+            read_done = threading.Event()
+
+            def _reader():
+                try:
+                    for raw_line in r.iter_lines():
+                        if read_done.is_set():
+                            break
+                        line_q.put(raw_line)
+                except Exception:
+                    pass
+                finally:
+                    line_q.put(None)
+
+            threading.Thread(target=_reader, daemon=True).start()
+
             try:
                 chunks = []
-                for raw_line in r.iter_lines():
+                while True:
                     if _inference_stop.is_set():
+                        read_done.set()
                         r.close()
-                        return None  # cancelled
+                        return None
+                    try:
+                        raw_line = line_q.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if raw_line is None:
+                        break
                     if not raw_line:
                         continue
-                    chunk = json.loads(raw_line)
+                    try:
+                        chunk = json.loads(raw_line)
+                    except Exception:
+                        continue
                     delta = chunk.get("message", {}).get("content", "")
                     if delta:
                         chunks.append(delta)
@@ -2523,12 +4178,20 @@ Never respond with plain text. Never omit the "action" key.
                         break
                 return {"message": {"content": "".join(chunks)}}
             finally:
+                read_done.set()
                 _inference_response = None
+
+        def _call_parallel(mdl, timeout_s):
+            """User-facing requests: always route to the primary host (PC 1).
+            The background host (PC 2) is reserved for vision/ambient tasks."""
+            payload["model"] = mdl
+            return _call(mdl, timeout_s,
+                         _url=_ollama_base_url(_primary_host()) + "/api/chat")
 
         data = None
         fallback_notice = ""
         try:
-            data = _call(model, 120)
+            data = _call_parallel(model, 120)
         except Exception:
             if model != CHAT_MODEL:
                 fallback_notice = f"⚠️ {model} timed out — used {CHAT_MODEL} instead."
@@ -2537,7 +4200,7 @@ Never respond with plain text. Never omit the "action" key.
                 if _ui_app is not None:
                     _ui_app.root.after(0, lambda: _ui_app.model_label.config(text=f"🤖 {CHAT_MODEL} (fallback)"))
                 try:
-                    data = _call(CHAT_MODEL, 60)
+                    data = _call_parallel(CHAT_MODEL, 60)
                 except Exception:
                     return f'{{"action": "chat", "args": {{"message": "❌ Both models timed out. Try a shorter request."}}}}'
             else:
@@ -2566,30 +4229,94 @@ def process_message(text: str) -> str:
     if not text:
         return ""
 
+    # ── Fast bypasses: check before embedding so we skip the Ollama HTTP call ──
+    # Script trigger
+    script_path = match_script(text)
+    if script_path:
+        result = run_script(script_path)
+        LAST_INTERACTION["text"] = text
+        LAST_INTERACTION["raw"] = result
+        CHAT_MEMORY.append({"role": "user", "content": text[:600]})
+        CHAT_MEMORY.append({"role": "assistant", "content": result[:600]})
+        if len(CHAT_MEMORY) > 8:
+            CHAT_MEMORY = CHAT_MEMORY[-8:]
+        return result
+
+    # Direct camera command intercepts
+    import re as _re
+    _tl = text.lower().strip().strip("'\"")
+    _rem = _re.search(r"remember (?:my face|me) as (.+)", _tl)
+    if _rem:
+        name = _rem.group(1).strip().strip("'\"")
+        if _ui_app:
+            _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
+        return camera_engine.remember_face(name)
+    if _re.search(r"\b(who am i|recognize me|identify me|do you know me)\b", _tl):
+        if _ui_app:
+            _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
+        return camera_engine.identify_face()
+
+    # ── Calendar fast bypasses ─────────────────────────────────────────────────
+    # List events — never needs LLM
+    _cal_list_re = _re.compile(
+        r"\bwhat(?:'?s| is)(?: on)? my (?:calendar|schedule)\b"
+        r"|\bshow (?:me )?(?:my )?(?:calendar|schedule)\b"
+        r"|\b(?:my )?calendar (?:for )?(?:today|tomorrow|this week|this month|monday|tuesday|wednesday|thursday|friday)\b"
+        r"|\bwhat do i have (?:today|tomorrow|this week|this month|on (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b"
+        r"|\b(?:today|tomorrow|this week)'?s (?:calendar|schedule|events)\b"
+        r"|\blist (?:my )?(?:events|calendar|schedule)\b",
+        _re.I)
+    if _cal_list_re.search(_tl):
+        _period = "today"
+        for _w, _p in [("this week", "week"), ("this month", "month"),
+                       ("tomorrow", "tomorrow"), ("monday", "monday"),
+                       ("tuesday", "tuesday"), ("wednesday", "wednesday"),
+                       ("thursday", "thursday"), ("friday", "friday"),
+                       ("saturday", "saturday"), ("sunday", "sunday"),
+                       ("today", "today")]:
+            if _w in _tl:
+                _period = _p
+                break
+        return calendar_manager.list_events(_period, "all")
+
+    # Add event — parse with regex, no LLM needed
+    _cal_add_re = _re.compile(
+        r"\b(?:add|put|create|book|mark|set|note|log)\b.{2,120}\b(?:calendar|schedule)\b"
+        r"|\b(?:add|schedule|book|mark)\b.{2,80}\b(?:event|appointment|meeting|reminder)\b",
+        _re.I | _re.S)
+    if _cal_add_re.search(_tl):
+        _parsed = _parse_cal_add(text)
+        return calendar_manager.add_event(**_parsed)
+
+    # Status check
+    if _re.search(
+        r"\bcalendar (?:status|connected?|setup)\b"
+        r"|\bis (?:my )?calendar connected\b"
+        r"|\bconnect (?:google|apple|icloud) calendar\b",
+        _tl):
+        return calendar_manager.status()
+    # ── End fast bypasses ──────────────────────────────────────────────────────
+
     context = file_engine.get_folder_summary()
 
-    # Always embed the query — needed for chat history retrieval + existing memory search
+    # Inject today's calendar events for scheduling-aware responses
+    _cal_brief = calendar_manager.upcoming_brief()
+    if _cal_brief:
+        context += "\n\n" + _cal_brief
+
+    # Embed query once — shared by all memory retrieval calls below
     _query_emb = get_embedding(text)
 
-    # Inject semantically relevant explicit memories
-    memories = get_relevant_memories(text, emb=_query_emb)
-    if memories:
-        context += "\n\n" + memories
-
-    # Inject relevant playbooks (macro sequences for similar past tasks)
-    playbooks = get_relevant_playbooks(text, emb=_query_emb)
-    if playbooks:
-        context += "\n\n" + playbooks
-
-    # Inject learned patterns from past good interactions
-    learned = get_learned_context(text, emb=_query_emb)
-    if learned:
-        context += "\n\n" + learned
-
-    # Inject semantically relevant past chat history (top-3, capped at 3,200 chars)
-    past = chat_db.get_relevant_history(_query_emb)
-    if past:
-        context += "\n\n" + past
+    # Run all four memory lookups in parallel — they're independent I/O-bound calls
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=4) as _ex:
+        _f_mem  = _ex.submit(get_relevant_memories,   text, _query_emb)
+        _f_play = _ex.submit(get_relevant_playbooks,  text, _query_emb)
+        _f_lrn  = _ex.submit(get_learned_context,     text, _query_emb)
+        _f_hist = _ex.submit(chat_db.get_relevant_history, _query_emb)
+        for piece in (_f_mem.result(), _f_play.result(), _f_lrn.result(), _f_hist.result()):
+            if piece:
+                context += "\n\n" + piece
 
     # Warn once per session when accumulated memory is getting large
     global _memory_warned
@@ -2615,32 +4342,6 @@ def process_message(text: str) -> str:
         screen_ctx = screen_observer.get_context()
         if screen_ctx:
             context += "\n\n" + screen_ctx
-
-    # Script trigger — bypass LLM entirely for exact/partial phrase matches
-    script_path = match_script(text)
-    if script_path:
-        result = run_script(script_path)
-        LAST_INTERACTION["text"] = text
-        LAST_INTERACTION["raw"] = result
-        CHAT_MEMORY.append({"role": "user", "content": text[:600]})
-        CHAT_MEMORY.append({"role": "assistant", "content": result[:600]})
-        if len(CHAT_MEMORY) > 8:
-            CHAT_MEMORY = CHAT_MEMORY[-8:]
-        return result
-
-    # Direct camera command intercepts — bypass LLM to avoid timeout on short phrases
-    import re as _re
-    _tl = text.lower().strip().strip("'\"")
-    _rem = _re.search(r"remember (?:my face|me) as (.+)", _tl)
-    if _rem:
-        name = _rem.group(1).strip().strip("'\"")
-        if _ui_app:
-            _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
-        return camera_engine.remember_face(name)
-    if _re.search(r"\b(who am i|recognize me|identify me|do you know me)\b", _tl):
-        if _ui_app:
-            _ui_app.root.after(0, lambda: _ui_app._ensure_camera_open())
-        return camera_engine.identify_face()
 
     raw = ask_local_ai(text, context)
 
@@ -2755,7 +4456,10 @@ def process_message(text: str) -> str:
                 results.append(f"🔊 Current volume: {vol}%" if vol >= 0 else "❌ Could not read volume.")
                 executed_any = True
             elif action == "set_volume":
-                results.append(set_volume(int(args["level"])))
+                lvl = int(args["level"])
+                # Try Spotify API volume first (more accurate when music is playing)
+                sp_result = spotify_api.set_volume(lvl) if spotify_api.token() else None
+                results.append(sp_result if sp_result else set_volume(lvl))
                 executed_any = True
             elif action == "web_lookup":
                 if check_online():
@@ -2793,7 +4497,7 @@ def process_message(text: str) -> str:
                             "RESPOND WITH A SINGLE JSON OBJECT ONLY. No plain text outside the JSON."
                         )
                         try:
-                            r2 = requests.post(OLLAMA_URL, json={
+                            r2 = requests.post(_ollama_base_url(_bg_host()) + "/api/chat", json={
                                 "model": OLLAMA_MODEL,
                                 "messages": [{"role": "user", "content": action_prompt}],
                                 "stream": False,
@@ -2936,6 +4640,52 @@ def process_message(text: str) -> str:
             elif action == "camera_forget":
                 results.append(camera_engine.forget_face(args.get("name", "")))
                 executed_any = True
+            elif action == "spotify_connect":
+                results.append(spotify_api.authorize())
+                executed_any = True
+            elif action == "spotify_open":
+                results.append(spotify_engine.open())
+                executed_any = True
+            elif action == "spotify_play":
+                results.append(spotify_engine.play())
+                executed_any = True
+            elif action == "spotify_pause":
+                results.append(spotify_engine.pause())
+                executed_any = True
+            elif action == "spotify_next":
+                results.append(spotify_engine.next_track())
+                executed_any = True
+            elif action == "spotify_prev":
+                results.append(spotify_engine.prev_track())
+                executed_any = True
+            elif action == "spotify_search":
+                results.append(spotify_engine.search_and_play(args.get("query", "")))
+                executed_any = True
+            elif action == "spotify_now_playing":
+                results.append(spotify_engine.get_now_playing())
+                executed_any = True
+            elif action == "spotify_like":
+                results.append(spotify_engine.like_current())
+                executed_any = True
+            elif action == "spotify_seek":
+                import re as _re
+                _seek_str = str(args.get("position", "0")).strip()
+                # Parse "1:30", "90", or plain seconds → milliseconds
+                _seek_ms = 0
+                _mm = _re.match(r'^(\d+):(\d+)$', _seek_str)
+                if _mm:
+                    _seek_ms = (int(_mm.group(1)) * 60 + int(_mm.group(2))) * 1000
+                elif _re.match(r'^\d+$', _seek_str):
+                    _seek_ms = int(_seek_str) * 1000
+                elif "beginning" in _seek_str or "start" in _seek_str:
+                    _seek_ms = 0
+                else:
+                    try:
+                        _seek_ms = int(float(_seek_str)) * 1000
+                    except ValueError:
+                        _seek_ms = 0
+                results.append(spotify_api.seek(_seek_ms) or "❌ Seek failed — make sure something is playing.")
+                executed_any = True
             elif action == "set_voice":
                 global _tts_voice
                 requested = args.get("voice_id", "").strip().lower()
@@ -2962,6 +4712,37 @@ def process_message(text: str) -> str:
                 else:
                     options = ", ".join(_KOKORO_VOICES.keys())
                     results.append(f"❌ Couldn't match voice '{args.get('voice_id')}'. Options: {options}")
+                executed_any = True
+            elif action == "calendar_status":
+                results.append(calendar_manager.status())
+                executed_any = True
+            elif action == "calendar_connect_google":
+                results.append(calendar_manager.google_authorize())
+                executed_any = True
+            elif action == "calendar_connect_apple":
+                results.append(calendar_manager.apple_connect())
+                executed_any = True
+            elif action == "calendar_add":
+                results.append(calendar_manager.add_event(
+                    title        = args.get("title", "Event"),
+                    date_str     = args.get("date", "today"),
+                    time_str     = args.get("time", ""),
+                    duration_min = int(args.get("duration_minutes", 60)),
+                    notes        = args.get("notes", ""),
+                    calendar     = args.get("calendar", "google"),
+                ))
+                executed_any = True
+            elif action == "calendar_list":
+                results.append(calendar_manager.list_events(
+                    period   = args.get("period", "today"),
+                    calendar = args.get("calendar", "all"),
+                ))
+                executed_any = True
+            elif action == "calendar_delete":
+                results.append(calendar_manager.delete_event(
+                    query    = args.get("query", ""),
+                    calendar = args.get("calendar", "google"),
+                ))
                 executed_any = True
             else:
                 results.append(f"❌ Unknown action: {action}")
@@ -3006,103 +4787,225 @@ class AssistantApp:
         self.visible = False
         self._busy = False
         self._msg_queue: list[str] = []
+        self._pending_images: list[dict] = []   # each: {"b64": str, "name": str}
         self._build_window()
         self._apply_startup_defaults()
     def _build_window(self):
+        # ── Palette ───────────────────────────────────────────────────────
+        BG      = "#0d0d15"
+        HDR     = "#101020"
+        PANEL   = "#09090f"
+        BORDER  = "#1d1d30"
+        ACCENT  = "#4e4eb8"
+        CYAN    = "#5ce1e6"
+        DIM     = "#55556e"
+        TEXT    = "#d4d4ec"
+
         self.root = tk.Tk()
         self.root.title("Jarvis AI")
         self.root.geometry("1160x700")
-        self.root.configure(bg="#0f0f16")
+        self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
         self.root.withdraw()
-        self.main_frame = tk.Frame(self.root, bg="#0f0f16", bd=1, highlightbackground="#222235", highlightthickness=1)
+
+        self.main_frame = tk.Frame(self.root, bg=BG, bd=1,
+                                   highlightbackground=BORDER, highlightthickness=1)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
-        header = tk.Frame(self.main_frame, bg="#161623", height=54)
+
+        # ── Header ────────────────────────────────────────────────────────
+        header = tk.Frame(self.main_frame, bg=HDR, height=50)
         header.pack(fill=tk.X)
         header.pack_propagate(False)
-        tk.Label(header, text="🎩 JARVIS System Core", font=("Segoe UI", 12, "bold"), fg="#ffffff", bg="#161623").pack(side=tk.LEFT, padx=16, pady=14)
+
+        # Left: logo + title
+        logo_frame = tk.Frame(header, bg=HDR)
+        logo_frame.pack(side=tk.LEFT, padx=(14, 0))
+        tk.Label(logo_frame, text="◆", font=("Segoe UI", 13), fg=ACCENT, bg=HDR
+                 ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(logo_frame, text="JARVIS", font=("Segoe UI", 11, "bold"), fg=TEXT, bg=HDR
+                 ).pack(side=tk.LEFT)
+        tk.Label(logo_frame, text="AI", font=("Segoe UI", 9), fg=DIM, bg=HDR
+                 ).pack(side=tk.LEFT, padx=(5, 0), pady=(3, 0))
+
+        # Folder selector
         folder_label = config.get("watched_folder", "") or "No folder set"
-        self.folder_btn = tk.Button(header, text="📁 " + (Path(folder_label).name if folder_label != "No folder set" else "Select Directory"),
-                                    font=("Segoe UI Semibold", 9), fg="#9a9ab0", bg="#1e1e30", bd=0, cursor="hand2", padx=10, pady=4, command=self.pick_folder)
-        self.folder_btn.pack(side=tk.LEFT, padx=12, pady=10)
-        tk.Button(header, text="✕", font=("Segoe UI", 12), fg="#666680", bg="#161623", bd=0, cursor="hand2", command=self.hide).pack(side=tk.RIGHT, padx=16)
-        tk.Button(header, text="⚙", font=("Segoe UI", 13), fg="#666680", bg="#161623", bd=0, cursor="hand2", command=self.open_settings).pack(side=tk.RIGHT, padx=4)
-        self.model_label = tk.Label(header, text=f"🤖 {_active_model}", font=("Segoe UI", 9), fg="#5c5c80", bg="#161623")
-        self.model_label.pack(side=tk.RIGHT, padx=12)
-        chat_container = tk.Frame(self.main_frame, bg="#0f0f16")
-        chat_container.pack(fill=tk.BOTH, expand=True, padx=16, pady=(12, 0))
-        self.chat = scrolledtext.ScrolledText(chat_container, wrap=tk.WORD, state=tk.DISABLED, bg="#06060a", fg="#d1d1e0", font=("Consolas", 11), insertbackground="#5c5cff", relief=tk.FLAT, padx=14, pady=14, highlightthickness=1, highlightbackground="#1c1c28")
+        self.folder_btn = tk.Button(
+            header,
+            text="📁  " + (Path(folder_label).name if folder_label != "No folder set" else "No folder"),
+            font=("Segoe UI", 9), fg="#7878a0", bg="#17172a", bd=0,
+            cursor="hand2", padx=10, pady=4,
+            activebackground="#20203a", activeforeground=TEXT,
+            command=self.pick_folder)
+        self.folder_btn.pack(side=tk.LEFT, padx=14, pady=10)
+
+        # Right: model badge, settings, close
+        tk.Button(header, text="✕", font=("Segoe UI", 11), fg=DIM, bg=HDR, bd=0,
+                  cursor="hand2", activebackground="#1e1010", activeforeground="#ff6666",
+                  command=self.hide).pack(side=tk.RIGHT, padx=(0, 12), pady=10)
+        tk.Button(header, text="⚙", font=("Segoe UI", 12), fg=DIM, bg=HDR, bd=0,
+                  cursor="hand2", activebackground="#181828", activeforeground=TEXT,
+                  command=self.open_settings).pack(side=tk.RIGHT, padx=4, pady=10)
+        self.model_label = tk.Label(header, text=f"  {_active_model}",
+                                     font=("Segoe UI", 8), fg=DIM, bg=HDR)
+        self.model_label.pack(side=tk.RIGHT, padx=10)
+        self.speed_label = tk.Label(header, text=f"  {SPEED_MODE_LABEL.get(_speed_mode, _speed_mode)} Mode",
+                                     font=("Segoe UI", 8), fg=DIM, bg=HDR)
+        self.speed_label.pack(side=tk.RIGHT, padx=10)
+
+        # Accent stripe below header
+        tk.Frame(self.main_frame, bg=ACCENT, height=2).pack(fill=tk.X)
+
+        # ── Chat area ─────────────────────────────────────────────────────
+        chat_container = tk.Frame(self.main_frame, bg=BG)
+        chat_container.pack(fill=tk.BOTH, expand=True, padx=14, pady=(10, 0))
+        self.chat = scrolledtext.ScrolledText(
+            chat_container, wrap=tk.WORD, state=tk.DISABLED,
+            bg=PANEL, fg="#c8c8e0",
+            font=("Consolas", 11),
+            insertbackground=ACCENT,
+            relief=tk.FLAT, padx=16, pady=14,
+            highlightthickness=1, highlightbackground=BORDER)
         self.chat.pack(fill=tk.BOTH, expand=True)
-        self.chat.tag_config("user", foreground="#5ce1e6", font=("Consolas", 11, "bold"))
-        self.chat.tag_config("assistant", foreground="#e1e1ea")
-        self.chat.tag_config("system", foreground="#5c5c70", font=("Consolas", 10, "italic"))
-        self.chat.tag_config("thought", foreground="#7060a8", font=("Consolas", 10, "italic"))
-        # Queue strip — hidden when empty, shows pending messages as pill chips
-        self.queue_strip = tk.Frame(self.main_frame, bg="#0f0f16")
-        self._queue_label = tk.Label(self.queue_strip, text="Queued:", font=("Segoe UI", 8), fg="#5c5c80", bg="#0f0f16")
-        self._queue_label.pack(side=tk.LEFT, padx=(16, 6))
-        self._queue_chips_frame = tk.Frame(self.queue_strip, bg="#0f0f16")
+        self.chat.tag_config("user",      foreground=CYAN,    font=("Consolas", 11, "bold"))
+        self.chat.tag_config("assistant", foreground="#d0d0e8")
+        self.chat.tag_config("system",    foreground="#46465e", font=("Consolas", 10, "italic"))
+        self.chat.tag_config("thought",   foreground="#635598", font=("Consolas", 10, "italic"))
+
+        # ── Queue strip (hidden until messages are queued) ─────────────────
+        self.queue_strip = tk.Frame(self.main_frame, bg=BG)
+        self._queue_label = tk.Label(self.queue_strip, text="Queued:",
+                                      font=("Segoe UI", 8), fg=DIM, bg=BG)
+        self._queue_label.pack(side=tk.LEFT, padx=(14, 6))
+        self._queue_chips_frame = tk.Frame(self.queue_strip, bg=BG)
         self._queue_chips_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        # queue_strip is NOT packed here — it appears via _refresh_queue_strip when needed
-        self.input_container = tk.Frame(self.main_frame, bg="#0f0f16")
+
+        # ── Image preview strip (hidden until images are attached) ────────
+        self._preview_strip = tk.Frame(self.main_frame, bg=BG)
+        # (packed on demand by _update_image_preview)
+
+        # ── Input row ─────────────────────────────────────────────────────
+        self.input_container = tk.Frame(self.main_frame, bg=BG)
         input_container = self.input_container
-        input_container.pack(fill=tk.X, padx=16, pady=(12, 12))
+        input_container.pack(fill=tk.X, padx=14, pady=(8, 4))
+
         self.input_var = tk.StringVar()
-        self.entry = tk.Entry(input_container, textvariable=self.input_var, font=("Segoe UI", 11), bg="#06060a", fg="#ffffff", insertbackground="#5c5cff", relief=tk.FLAT, highlightthickness=1, highlightbackground="#1c1c28")
-        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=10, padx=(0, 10))
+        self.entry = tk.Entry(
+            input_container, textvariable=self.input_var,
+            font=("Segoe UI", 11), bg=PANEL, fg="#ffffff",
+            insertbackground=CYAN, relief=tk.FLAT,
+            highlightthickness=1, highlightbackground=BORDER)
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=11, padx=(0, 8))
         self.entry.bind("<Return>", self.send)
         self.entry.bind("<Escape>", lambda e: self.hide())
-        self.send_btn = tk.Button(input_container, text="Send", font=("Segoe UI Semibold", 10), bg="#4747b2", fg="#ffffff", relief=tk.FLAT, cursor="hand2", padx=20, pady=8, command=self.send)
-        self.send_btn.pack(side=tk.RIGHT)
-        # -- Speech Framework Toggle Variable Configurations --
-        self.mic_mode = "off"   # "off" | "auto" | "ptt"
-        self.voice_mode = False  # True only when mic_mode == "auto"
-        self.tts_muted = True   # voice muted by default
-        self._ptt_active = False
-        self.camera_btn = tk.Button(input_container, text="📷 Cam", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_camera)
-        self.camera_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.websearch_btn = tk.Button(input_container, text="🔍", font=("Segoe UI Semibold", 10), bg="#0f2a3a", fg="#44bbee", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.web_search_send)
-        self.websearch_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.online_btn = tk.Button(input_container, text="🌐 Online", font=("Segoe UI Semibold", 10), bg="#1a3a1a", fg="#44cc66", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_online_mode)
-        self.online_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.think_btn = tk.Button(input_container, text="📺 Screen", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_think_mode)
-        self.think_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.mute_btn = tk.Button(input_container, text="🔇 Muted", font=("Segoe UI Semibold", 10), bg="#222235", fg="#ff5555", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_tts)
-        self.mute_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.mic_btn = tk.Button(input_container, text="🎤 Off", font=("Segoe UI Semibold", 10), bg="#222235", fg="#9a9ab0", relief=tk.FLAT, cursor="hand2", padx=12, pady=8, command=self.toggle_voice_mode)
-        self.mic_btn.pack(side=tk.RIGHT, padx=(0, 6))
-        self.ptt_container = tk.Frame(self.main_frame, bg="#0f0f16")
-        self.ptt_container.pack(fill=tk.X, padx=16, pady=0)
-        self.ptt_btn = tk.Button(self.ptt_container, text="🎙  Hold to Talk — Release to Send",
-                                  font=("Segoe UI Semibold", 11), bg="#7d47b2", fg="#ffffff",
-                                  relief=tk.FLAT, cursor="hand2", padx=20, pady=10)
-        self.ptt_btn.bind("<ButtonPress-1>", self._ptt_press)
-        self.ptt_btn.bind("<ButtonRelease-1>", self._ptt_release)
-        # ptt_btn starts hidden — shown only in push-to-talk mode
 
-        feedback_bar = tk.Frame(self.main_frame, bg="#0f0f16")
-        feedback_bar.pack(fill=tk.X, padx=16, pady=(0, 4))
-        tk.Label(feedback_bar, text="Rate:", font=("Segoe UI", 8), fg="#404054", bg="#0f0f16").pack(side=tk.LEFT)
-        tk.Label(feedback_bar, text="👎", font=("Segoe UI", 10), bg="#0f0f16", fg="#ff5555").pack(side=tk.LEFT, padx=(6, 2))
-        _rating_colors = {
-            -5: "#8b0000", -4: "#bb2222", -3: "#cc4444",
-            -2: "#cc6633", -1: "#aa8833",
-             0: "#444455",
-             1: "#3388aa",  2: "#22aaaa",  3: "#11bb88",
-             4: "#33ccbb",  5: "#5ce1e6",
-        }
+        # Send / Stop button
+        self.send_btn = tk.Button(
+            input_container, text="Send",
+            font=("Segoe UI Semibold", 10), bg=ACCENT, fg="#ffffff",
+            relief=tk.FLAT, cursor="hand2", padx=22, pady=9,
+            activebackground="#6060cc", activeforeground="#ffffff",
+            command=self.send)
+        self.send_btn.pack(side=tk.RIGHT)
+
+        # Mode dropdown button
+        self.options_btn = tk.Button(
+            input_container, text="⚙  Modes ▾",
+            font=("Segoe UI", 10), bg="#181828", fg="#8080b8",
+            relief=tk.FLAT, cursor="hand2", padx=12, pady=9,
+            activebackground="#20203a", activeforeground=TEXT,
+            command=self._open_options_menu)
+        self.options_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        # Web search / file search button
+        self.websearch_btn = tk.Button(
+            input_container, text="🔍",
+            font=("Segoe UI Semibold", 10), bg="#0e2030", fg="#44bbee",
+            relief=tk.FLAT, cursor="hand2", padx=12, pady=9,
+            activebackground="#122840", activeforeground="#66ddff",
+            command=self.web_search_send)
+        self.websearch_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        # Attach image / PDF button
+        self.attach_btn = tk.Button(
+            input_container, text="📎",
+            font=("Segoe UI", 13), bg="#0e1e30", fg="#55aadd",
+            relief=tk.FLAT, cursor="hand2", padx=10, pady=7,
+            activebackground="#12283a", activeforeground="#77ccff",
+            command=self._attach_image)
+        self.attach_btn.pack(side=tk.RIGHT, padx=(0, 4))
+
+        # ── Speech state variables ─────────────────────────────────────────
+        self.mic_mode   = "off"
+        self.voice_mode = False
+        self.tts_muted  = True
+        self._ptt_active = False
+        self._speed_mode_var = tk.StringVar(value=_speed_mode)
+
+        # Mic button — visible, cycles off → live → ptt
+        self.mic_btn = tk.Button(
+            input_container, text="🎤  Off",
+            font=("Segoe UI", 10), bg="#181828", fg="#5a5a7a",
+            relief=tk.FLAT, cursor="hand2", padx=12, pady=9,
+            activebackground="#20203a", activeforeground="#ffffff",
+            command=self.toggle_voice_mode)
+        self.mic_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        # TTS mute button — visible, toggles muted / on
+        self.mute_btn = tk.Button(
+            input_container, text="🔇  Muted",
+            font=("Segoe UI", 10), bg="#181828", fg="#cc4444",
+            relief=tk.FLAT, cursor="hand2", padx=12, pady=9,
+            activebackground="#20203a", activeforeground="#ffffff",
+            command=self.toggle_tts)
+        self.mute_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        # Ghost buttons — not packed, toggle methods can still .config() them
+        _ghost = tk.Frame(self.root, bg=BG)   # never packed — invisible container
+        self.think_btn  = tk.Button(_ghost, text="📺 Screen")
+        self.online_btn = tk.Button(_ghost, text="🌐 Online")
+        self.camera_btn = tk.Button(_ghost, text="📷 Cam")
+
+        # PTT bar (hidden until PTT mode activated)
+        self.ptt_container = tk.Frame(self.main_frame, bg=BG)
+        self.ptt_container.pack(fill=tk.X, padx=14, pady=0)
+        self.ptt_btn = tk.Button(
+            self.ptt_container, text="🎙  Hold to Talk — Release to Send",
+            font=("Segoe UI Semibold", 11), bg="#6a3aaa", fg="#ffffff",
+            relief=tk.FLAT, cursor="hand2", padx=20, pady=10,
+            activebackground="#7a4abb")
+        self.ptt_btn.bind("<ButtonPress-1>",  self._ptt_press)
+        self.ptt_btn.bind("<ButtonRelease-1>", self._ptt_release)
+
+        # ── Bottom bar: status left, feedback right ────────────────────────
+        bottom = tk.Frame(self.main_frame, bg=BG)
+        bottom.pack(fill=tk.X, padx=14, pady=(4, 7))
+
+        self.status_var = tk.StringVar(value="System Active  •  Whisper Enabled")
+        tk.Label(bottom, textvariable=self.status_var,
+                 font=("Segoe UI", 8, "italic"), fg=DIM, bg=BG, anchor="w"
+                 ).pack(side=tk.LEFT)
+
+        # Feedback rating (right-aligned, compact)
+        fb = tk.Frame(bottom, bg=BG)
+        fb.pack(side=tk.RIGHT)
+        tk.Label(fb, text="Rate:", font=("Segoe UI", 8), fg=DIM, bg=BG
+                 ).pack(side=tk.LEFT, padx=(0, 5))
+        _rc = {-5:"#7a0000",-4:"#a01818",-3:"#b83030",
+               -2:"#b05020",-1:"#907020",
+                0:"#343447",
+                1:"#1d6688", 2:"#178899", 3:"#0ea870",
+                4:"#18b89a", 5:"#30ced4"}
         for r in range(-5, 6):
-            val = r
-            tk.Button(
-                feedback_bar, text=str(r), font=("Consolas", 8, "bold"),
-                bg=_rating_colors[r], fg="#ffffff", bd=0, cursor="hand2",
-                width=2, pady=1, relief=tk.FLAT,
-                command=lambda v=val: self._give_feedback(v)
-            ).pack(side=tk.LEFT, padx=1)
-        tk.Label(feedback_bar, text="👍", font=("Segoe UI", 10), bg="#0f0f16", fg="#5ce1e6").pack(side=tk.LEFT, padx=(2, 0))
-        self.status_var = tk.StringVar(value="System Active  •  Offline Whisper Array Enabled")
-        tk.Label(self.main_frame, textvariable=self.status_var, font=("Segoe UI", 8, "italic"), fg="#404054", bg="#0f0f16", anchor="w").pack(fill=tk.X, padx=18, pady=(0, 8))
-        self._append_message("system", "⚡ Local Jarvis Framework Initialized. Speech Processing shifted 100% locally via Faster-Whisper.")
+            v = r
+            tk.Button(fb, text=str(r) if r != 0 else "·",
+                      font=("Consolas", 7, "bold"),
+                      bg=_rc[r], fg="#dde", bd=0, cursor="hand2",
+                      width=2, pady=1, relief=tk.FLAT,
+                      command=lambda x=v: self._give_feedback(x)
+                      ).pack(side=tk.LEFT, padx=1)
+
+        self._append_message("system",
+            "⚡ Local Jarvis Framework Initialized. Speech Processing shifted 100% locally via Faster-Whisper.")
 
     def _apply_startup_defaults(self):
         target_mode = config.get("default_mic_mode", "off")
@@ -3113,6 +5016,40 @@ class AssistantApp:
         if not config.get("tts_muted_default", True):
             self.toggle_tts()  # flip from default-muted to unmuted
         task_scheduler.start(self)
+
+    def _open_options_menu(self):
+        """Pop up a dropdown menu below the Modes button."""
+        screen_label = "📺  Screen Share  ·  On" if screen_observer.active else "📺  Screen Share  ·  Off"
+        cam_label    = "📷  Camera  ·  On"       if camera_engine._running  else "📷  Camera  ·  Off"
+        online_label = "✈️   Mode  ·  Offline"    if _offline_mode          else "🌐  Mode  ·  Online"
+
+        menu = tk.Menu(self.root, tearoff=0,
+                       bg="#141426", fg="#c0c0e0",
+                       activebackground="#2a2a4a", activeforeground="#ffffff",
+                       bd=1, relief=tk.FLAT, font=("Segoe UI", 10))
+        menu.add_command(label=screen_label, command=self.toggle_think_mode)
+        menu.add_command(label=online_label, command=self.toggle_online_mode)
+        speed_menu = tk.Menu(menu, tearoff=0,
+                             bg="#141426", fg="#c0c0e0",
+                             activebackground="#2a2a4a", activeforeground="#ffffff",
+                             bd=1, relief=tk.FLAT, font=("Segoe UI", 10))
+        for mode in (FAST_MODE, BALANCED_MODE, DEEP_MODE):
+            speed_menu.add_radiobutton(
+                label=SPEED_MODE_LABEL[mode],
+                variable=self._speed_mode_var,
+                value=mode,
+                command=lambda m=mode: self._set_speed_mode(m)
+            )
+        menu.add_cascade(label=f"⚡ Speed · {SPEED_MODE_LABEL.get(_speed_mode, _speed_mode)}", menu=speed_menu)
+        menu.add_separator()
+        menu.add_command(label=cam_label,    command=self.toggle_camera)
+
+        btn = self.options_btn
+        try:
+            menu.tk_popup(btn.winfo_rootx(),
+                          btn.winfo_rooty() + btn.winfo_height() + 2)
+        finally:
+            menu.grab_release()
 
     def _show_memory_warning(self):
         win = tk.Toplevel(self.root)
@@ -3215,6 +5152,17 @@ class AssistantApp:
             self._cam_window = None
         else:
             self._open_camera_window()
+
+    def _set_speed_mode(self, mode: str):
+        global _speed_mode
+        if mode not in (FAST_MODE, BALANCED_MODE, DEEP_MODE):
+            return
+        _speed_mode = mode
+        config["assistant_speed_mode"] = mode
+        save_config(config)
+        self._speed_mode_var.set(mode)
+        self.speed_label.config(text=f"  {SPEED_MODE_LABEL.get(mode, mode)} Mode")
+        self._append_message("system", f"⚡ Speed mode set to {SPEED_MODE_LABEL.get(mode, mode)}.")
 
     def _ensure_camera_open(self):
         if not camera_engine._running:
@@ -3379,14 +5327,20 @@ class AssistantApp:
 
     def send(self, event=None):
         text = self.input_var.get().strip()
-        if not text:
+        if not text and not self._pending_images:
             return
         self.input_var.set("")
         if self._busy:
             self._msg_queue.append(text)
             self._refresh_queue_strip()
             return
-        self._start_request(text)
+        if self._pending_images:
+            images = self._pending_images[:]
+            self._pending_images.clear()
+            self._update_image_preview()
+            self._start_request_with_images(text, images)
+        else:
+            self._start_request(text)
 
     def _start_request(self, text: str):
         self._busy = True
@@ -3400,6 +5354,130 @@ class AssistantApp:
             self.root.after(0, lambda: self._on_response(response))
 
         threading.Thread(target=run, daemon=True).start()
+
+    # ── Image attachment methods ───────────────────────────────────────────────
+
+    def _attach_image(self):
+        """Open a file dialog, load an image or PDF, add to pending images."""
+        path = filedialog.askopenfilename(
+            title="Attach Image or PDF",
+            filetypes=[
+                ("Images & PDF", "*.jpg *.jpeg *.png *.gif *.bmp *.webp *.pdf"),
+                ("Images", "*.jpg *.jpeg *.png *.gif *.bmp *.webp"),
+                ("PDF", "*.pdf"),
+                ("All files", "*.*"),
+            ]
+        )
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".pdf":
+                b64 = self._pdf_page_to_b64(path)
+            else:
+                from PIL import Image as _PI
+                img = _PI.open(path).convert("RGB")
+                img.thumbnail((1280, 1280))
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=88)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+        except Exception as e:
+            self._append_message("system", f"❌ Could not load file: {e}")
+            return
+        name = os.path.basename(path)
+        self._pending_images.append({"b64": b64, "name": name})
+        self._update_image_preview()
+        self.entry.focus()
+
+    def _pdf_page_to_b64(self, path: str) -> str:
+        """Render first page of a PDF to a JPEG base64 string."""
+        try:
+            import fitz
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pymupdf"],
+                           check=True)
+            import fitz
+        doc  = fitz.open(path)
+        page = doc[0]
+        pix  = page.get_pixmap(dpi=150)
+        buf  = BytesIO(pix.tobytes("png"))
+        from PIL import Image as _PI
+        img  = _PI.open(buf).convert("RGB")
+        img.thumbnail((1280, 1280))
+        out  = BytesIO()
+        img.save(out, format="JPEG", quality=88)
+        return base64.b64encode(out.getvalue()).decode()
+
+    def _update_image_preview(self):
+        """Rebuild the preview strip above the input box."""
+        from PIL import Image as _PI, ImageTk
+        for w in self._preview_strip.winfo_children():
+            w.destroy()
+        if not self._pending_images:
+            self._preview_strip.pack_forget()
+            return
+        self._preview_strip.pack(fill=tk.X, padx=14, pady=(4, 0),
+                                  before=self.input_container)
+        for i, img_data in enumerate(self._pending_images):
+            idx = i
+            chip = tk.Frame(self._preview_strip, bg="#12182a", padx=0, pady=0)
+            chip.pack(side=tk.LEFT, padx=(0, 6), pady=2)
+            try:
+                raw   = base64.b64decode(img_data["b64"])
+                thumb = _PI.open(BytesIO(raw))
+                thumb.thumbnail((44, 44))
+                photo = ImageTk.PhotoImage(thumb)
+                img_data["_photo"] = photo   # prevent GC
+                tk.Label(chip, image=photo, bg="#12182a", padx=2, pady=2).pack(side=tk.LEFT)
+            except Exception:
+                pass
+            label = img_data["name"]
+            if len(label) > 22:
+                label = label[:19] + "…"
+            tk.Label(chip, text=label, font=("Segoe UI", 8), fg="#8898cc",
+                     bg="#12182a", padx=4, pady=2).pack(side=tk.LEFT)
+            tk.Button(chip, text="×", font=("Segoe UI", 9, "bold"), fg="#665577",
+                      bg="#12182a", bd=0, cursor="hand2", padx=4, pady=2,
+                      command=lambda x=idx: self._remove_pending_image(x)).pack(side=tk.LEFT)
+
+    def _remove_pending_image(self, idx: int):
+        if 0 <= idx < len(self._pending_images):
+            self._pending_images.pop(idx)
+            self._update_image_preview()
+
+    def _start_request_with_images(self, text: str, images: list):
+        self._busy = True
+        _inference_stop.clear()
+        label = f"📎 {text}" if text else f"📎 {len(images)} image(s)"
+        self._append_message("user", label)
+        self.status_var.set("Analyzing image...")
+        self.send_btn.config(text="Stop", bg="#aa2222", fg="#ffffff", command=self._cancel_request)
+
+        def run():
+            response = self._process_image_query(text, images)
+            self.root.after(0, lambda: self._on_response(response))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _process_image_query(self, question: str, images: list) -> str:
+        model = _detect_vision_model()
+        if not model:
+            return ("❌ No vision model found. Install one with:\n"
+                    "  ollama pull llava\n"
+                    "Then restart the assistant.")
+        if not question:
+            question = ("Describe everything you see in full detail. "
+                        "Read all text visible in the image exactly as written. "
+                        "If it is a document or form, summarize its contents.")
+        results = []
+        for img_data in images:
+            desc = _ask_vision(img_data["b64"], model, question, max_tokens=800)
+            if len(images) > 1:
+                prefix = f"**{img_data['name']}:** "
+            else:
+                prefix = ""
+            results.append(prefix + (desc or "❌ Vision model returned no response."))
+        return "\n\n".join(results)
 
     def _cancel_request(self):
         global _inference_response
@@ -3848,6 +5926,8 @@ class AssistantApp:
         ).grid(row=5, column=1, padx=6, pady=10, sticky="w")
 
         # ── Row 6: Ollama Hosts ────────────────────────────────────────────────
+        # Each host has a checkbox — checked = included in the parallel race.
+        # Multiple checked = fastest-first mode; one checked = single-host mode.
         tk.Label(main_layer, text="Ollama Hosts:", font=("Segoe UI", 10),
                  fg="#9a9ab0", bg="#0f0f16"
                  ).grid(row=6, column=0, padx=16, pady=(10, 0), sticky="ne")
@@ -3855,72 +5935,206 @@ class AssistantApp:
         hosts_panel = tk.Frame(main_layer, bg="#0f0f16")
         hosts_panel.grid(row=6, column=1, padx=6, pady=(8, 4), sticky="ew")
 
-        lb_wrap = tk.Frame(hosts_panel, bg="#0f0f16")
-        lb_wrap.pack(fill=tk.X)
+        # Status label (defined first so host-row Test buttons can update it)
+        conn_lbl = tk.Label(hosts_panel,
+                            text="Check hosts to activate. Multiple = parallel race mode.",
+                            font=("Segoe UI", 8), fg="#5c5c70", bg="#0f0f16", anchor="w")
+        conn_lbl.pack(fill=tk.X, pady=(0, 4))
 
-        hosts_lb = tk.Listbox(lb_wrap, font=("Consolas", 10), bg="#06060a", fg="#d1d1e0",
-                              selectbackground="#222235", selectforeground="#5ce1e6",
-                              relief=tk.FLAT, highlightbackground="#1c1c28", highlightthickness=1,
-                              height=4, width=34)
-        hosts_lb.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        _lb_sb = tk.Scrollbar(lb_wrap, orient=tk.VERTICAL, command=hosts_lb.yview)
-        _lb_sb.pack(side=tk.RIGHT, fill=tk.Y)
-        hosts_lb.config(yscrollcommand=_lb_sb.set)
+        # Scrollable canvas for the checkbox rows
+        _hc_frame = tk.Frame(hosts_panel, bg="#0f0f16")
+        _hc_frame.pack(fill=tk.X)
 
-        _all_hosts = list(config.get("ollama_hosts", [config.get("ollama_host", "localhost")]))
+        _hc_canvas = tk.Canvas(_hc_frame, bg="#06060a", height=110,
+                               highlightthickness=1, highlightbackground="#1c1c28")
+        _hc_sb = tk.Scrollbar(_hc_frame, orient=tk.VERTICAL, command=_hc_canvas.yview)
+        _hc_canvas.configure(yscrollcommand=_hc_sb.set)
+        _hc_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        _hc_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        def _refresh_lb():
-            hosts_lb.delete(0, tk.END)
-            active = config.get("ollama_host", "localhost")
-            for h in _all_hosts:
-                label = f"  [ACTIVE]  {h}" if h == active else f"           {h}"
-                hosts_lb.insert(tk.END, label)
+        _hc_inner = tk.Frame(_hc_canvas, bg="#06060a")
+        _hc_win   = _hc_canvas.create_window((0, 0), window=_hc_inner, anchor="nw")
 
-        _refresh_lb()
+        def _hc_resize(*_):
+            _hc_canvas.configure(scrollregion=_hc_canvas.bbox("all"))
+        def _hc_width(_e):
+            _hc_canvas.itemconfig(_hc_win, width=_e.width)
+        _hc_inner.bind("<Configure>", _hc_resize)
+        _hc_canvas.bind("<Configure>",  _hc_width)
 
-        action_row = tk.Frame(hosts_panel, bg="#0f0f16")
-        action_row.pack(fill=tk.X, pady=(4, 0))
+        _all_hosts = [_normalize_ollama_host(h)
+                      for h in config.get("ollama_hosts",
+                                          [config.get("ollama_host", "localhost")])]
+        _active_now = [_normalize_ollama_host(h)
+                       for h in config.get("ollama_active_hosts",
+                                           [config.get("ollama_host", "localhost")])]
+        _host_vars:     dict = {}   # host -> BooleanVar  (checkbox active state)
+        _host_gpu_vars: dict = {}   # host -> StringVar   (num_gpu value)
+        _host_role_vars: dict = {}  # host -> StringVar   (role: primary/vision/pool/all)
+        _host_settings       = config.get("ollama_host_settings", {})
+        _ROLES = ["all", "primary", "vision", "pool"]
+        _ROLE_COLORS = {
+            "primary": "#5c9aff",   # blue
+            "vision":  "#cc88ff",   # purple
+            "pool":    "#5cff5c",   # green
+            "all":     "#888899",   # grey
+        }
+        _ROLE_BG = {
+            "primary": "#060c1a",   # barely blue
+            "vision":  "#0e0618",   # barely purple
+            "pool":    "#060e06",   # barely green
+            "all":     "#080808",   # default dark
+        }
 
-        def _set_active():
-            sel = hosts_lb.curselection()
-            if not sel:
-                return
-            config["ollama_host"] = _all_hosts[sel[0]]
-            _refresh_lb()
-            conn_lbl.config(text=f"Active: {config['ollama_host']} — press Save to apply.", fg="#5ce1e6")
+        def _add_host_row(h: str):
+            """One row: [COLOR STRIPE][✓] host   [● ROLE ▾]  GPU:[999]  [Test] [×]"""
+            if h not in _host_vars:
+                _host_vars[h]      = tk.BooleanVar(value=(h in _active_now))
+                _host_gpu_vars[h]  = tk.StringVar(
+                    value=str(_host_settings.get(h, {}).get("num_gpu", 999)))
+                _host_role_vars[h] = tk.StringVar(
+                    value=_host_settings.get(h, {}).get("role", "all"))
 
-        def _remove_host():
-            sel = hosts_lb.curselection()
-            if not sel or len(_all_hosts) <= 1:
-                return
-            idx = sel[0]
-            removed = _all_hosts.pop(idx)
-            if removed == config.get("ollama_host", "localhost"):
-                config["ollama_host"] = _all_hosts[0]
-            _refresh_lb()
+            def _col():  return _ROLE_COLORS.get(_host_role_vars[h].get(), "#888899")
+            def _bg():   return _ROLE_BG.get(_host_role_vars[h].get(), "#080808")
 
-        tk.Button(action_row, text="Set Active", font=("Segoe UI", 9),
-                  bg="#1a2a4a", fg="#5c9aff", relief=tk.FLAT, cursor="hand2",
-                  padx=6, pady=3, command=_set_active).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(action_row, text="Remove", font=("Segoe UI", 9),
-                  bg="#3a1a1a", fg="#ff7777", relief=tk.FLAT, cursor="hand2",
-                  padx=6, pady=3, command=_remove_host).pack(side=tk.LEFT)
+            # ── Outer wrapper + colored left stripe ───────────────────────────
+            wrapper = tk.Frame(_hc_inner, bg="#030305")
+            wrapper.pack(fill=tk.X, pady=1)
 
+            stripe = tk.Frame(wrapper, width=5, bg=_col())
+            stripe.pack(side=tk.LEFT, fill=tk.Y)
+            stripe.pack_propagate(False)
+
+            row = tk.Frame(wrapper, bg=_bg())
+            row.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            # ── Left: checkbox + host label ───────────────────────────────────
+            cb = tk.Checkbutton(row, variable=_host_vars[h],
+                                bg=_bg(), fg="#5ce1e6", selectcolor="#1a1a30",
+                                activebackground=_bg(), activeforeground="#5ce1e6")
+            cb.pack(side=tk.LEFT, padx=(5, 0))
+
+            host_lbl = tk.Label(row, text=h, font=("Consolas", 9),
+                                fg="#d1d1e0", bg=_bg(), anchor="w")
+            host_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+            # ── Right: × remove ───────────────────────────────────────────────
+            def _remove(host=h, wr=wrapper):
+                if len(_all_hosts) <= 1:
+                    return
+                _all_hosts.remove(host)
+                _host_vars.pop(host, None)
+                _host_gpu_vars.pop(host, None)
+                _host_role_vars.pop(host, None)
+                wr.destroy()
+                _hc_resize()
+
+            tk.Button(row, text="×", font=("Segoe UI", 10, "bold"),
+                      fg="#ff6666", bg="#1a0808", bd=0, cursor="hand2",
+                      padx=5, pady=0, command=_remove
+                      ).pack(side=tk.RIGHT, padx=(0, 4))
+
+            # ── Right: Test button ────────────────────────────────────────────
+            def _test(host=h):
+                conn_lbl.config(text=f"Testing {host}...", fg="#9a9ab0")
+                def _do():
+                    try:
+                        r2 = requests.get(_ollama_base_url(host) + "/api/tags", timeout=5)
+                        if r2.status_code == 200:
+                            mods = [m.get("name", "") for m in r2.json().get("models", [])]
+                            snippet = ", ".join(mods[:3]) or "no models"
+                            win.after(0, lambda: conn_lbl.config(
+                                text=f"{host}: {snippet}", fg="#5cff5c"))
+                        else:
+                            win.after(0, lambda: conn_lbl.config(
+                                text=f"{host}: HTTP {r2.status_code}", fg="#ffaa00"))
+                    except Exception as exc:
+                        win.after(0, lambda: conn_lbl.config(
+                            text=f"{host}: {exc}", fg="#ff5555"))
+                threading.Thread(target=_do, daemon=True).start()
+
+            tk.Button(row, text="Test", font=("Segoe UI", 8),
+                      fg="#44bbee", bg="#0a1a2a", bd=0, cursor="hand2",
+                      padx=5, pady=1, command=_test
+                      ).pack(side=tk.RIGHT, padx=(0, 2))
+
+            # ── Right: GPU entry ──────────────────────────────────────────────
+            gpu_lbl = tk.Label(row, text="GPU:", font=("Segoe UI", 8),
+                               fg="#555570", bg=_bg())
+            gpu_lbl.pack(side=tk.RIGHT, padx=(0, 1))
+            tk.Entry(row, textvariable=_host_gpu_vars[h], width=5,
+                     font=("Consolas", 8), bg="#0d0d18", fg="#9999cc",
+                     insertbackground="#5c5cff", relief=tk.FLAT,
+                     highlightthickness=1, highlightbackground="#222235"
+                     ).pack(side=tk.RIGHT, ipady=2, padx=(0, 5))
+
+            # ── Right: colored role badge — click to pick ─────────────────────
+            def _show_role_picker(event=None, host=h):
+                m = tk.Menu(win, tearoff=0, bg="#0d0d18",
+                            font=("Segoe UI", 9), bd=0, relief=tk.FLAT)
+                for role in _ROLES:
+                    rc = _ROLE_COLORS.get(role, "#888899")
+                    m.add_command(
+                        label=f"  {role.upper()}",
+                        foreground=rc,
+                        activeforeground=rc,
+                        activebackground="#1e1e30",
+                        command=lambda r=role, host=host: _host_role_vars[host].set(r),
+                    )
+                try:
+                    m.tk_popup(event.x_root, event.y_root)
+                finally:
+                    m.grab_release()
+
+            role_badge = tk.Label(
+                row,
+                text=f"  {_host_role_vars[h].get().upper()}  ▾",
+                font=("Segoe UI", 8, "bold"),
+                fg=_col(), bg=_bg(),
+                cursor="hand2", padx=4, pady=2,
+            )
+            role_badge.bind("<Button-1>", lambda e, host=h: _show_role_picker(e, host=host))
+            role_badge.pack(side=tk.RIGHT, padx=(0, 2))
+
+            # ── Live color refresh on role change ─────────────────────────────
+            def _refresh(*_):
+                col = _col()
+                bg  = _bg()
+                stripe.config(bg=col)
+                row.config(bg=bg)
+                cb.config(bg=bg, activebackground=bg)
+                host_lbl.config(bg=bg)
+                gpu_lbl.config(bg=bg)
+                role_badge.config(
+                    fg=col, bg=bg,
+                    text=f"  {_host_role_vars[h].get().upper()}  ▾",
+                )
+
+            _host_role_vars[h].trace_add("write", _refresh)
+
+        for _h in _all_hosts:
+            _add_host_row(_h)
+
+        # Add-host row
         add_row = tk.Frame(hosts_panel, bg="#0f0f16")
         add_row.pack(fill=tk.X, pady=(6, 0))
 
         new_host_var = tk.StringVar()
-        new_host_entry = tk.Entry(add_row, textvariable=new_host_var, font=("Consolas", 10),
-                                  bg="#06060a", fg="#ffffff", insertbackground="#5c5cff",
-                                  relief=tk.FLAT, width=18, highlightbackground="#1c1c28",
+        new_host_entry = tk.Entry(add_row, textvariable=new_host_var,
+                                  font=("Consolas", 10),
+                                  bg="#06060a", fg="#ffffff",
+                                  insertbackground="#5c5cff", relief=tk.FLAT,
+                                  width=20, highlightbackground="#1c1c28",
                                   highlightthickness=1)
         new_host_entry.pack(side=tk.LEFT, ipady=4, padx=(0, 4))
 
-        def _add_host(event=None):
-            h = new_host_var.get().strip()
+        def _add_host(*_):
+            h = _normalize_ollama_host(new_host_var.get().strip())
             if h and h not in _all_hosts:
                 _all_hosts.append(h)
-                _refresh_lb()
+                _add_host_row(h)
+                _hc_resize()
             new_host_var.set("")
 
         new_host_entry.bind("<Return>", _add_host)
@@ -3928,63 +6142,221 @@ class AssistantApp:
                   bg="#2a4a2a", fg="#5cff5c", relief=tk.FLAT, cursor="hand2",
                   padx=6, pady=3, command=_add_host).pack(side=tk.LEFT)
 
-        test_row = tk.Frame(hosts_panel, bg="#0f0f16")
-        test_row.pack(fill=tk.X, pady=(6, 0))
+        # ── Row 7: Spotify ─────────────────────────────────────────────────────
+        _lbl(7, "Spotify:")
+        spotify_frame = tk.Frame(main_layer, bg="#0f0f16")
+        spotify_frame.grid(row=7, column=1, padx=6, pady=8, sticky="w")
 
-        conn_lbl = tk.Label(test_row, text="Select a host, then click Test.",
-                            font=("Segoe UI", 8), fg="#5c5c70", bg="#0f0f16", anchor="w")
-        conn_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        sp_client_id_var  = tk.StringVar(value=config.get("spotify_client_id", ""))
+        sp_client_sec_var = tk.StringVar(value=config.get("spotify_client_secret", ""))
 
-        def _test_connection():
-            sel = hosts_lb.curselection()
-            if not sel:
-                conn_lbl.config(text="Select a host first.", fg="#ffaa00")
-                return
-            host = _all_hosts[sel[0]]
-            conn_lbl.config(text=f"Testing {host}...", fg="#9a9ab0")
-            win.update_idletasks()
+        has_bundled = bool(_SPOTIFY_BUNDLED_CLIENT_ID)
 
-            def _do_test():
-                try:
-                    r = requests.get(f"http://{host}:11434/api/tags", timeout=5)
-                    if r.status_code == 200:
-                        models = [m.get("name", "") for m in r.json().get("models", [])]
-                        snippet = ", ".join(models[:4]) or "(no models)"
-                        win.after(0, lambda: conn_lbl.config(
-                            text=f"Connected: {snippet}", fg="#5cff5c"))
-                    else:
-                        win.after(0, lambda: conn_lbl.config(
-                            text=f"HTTP {r.status_code} from {host}", fg="#ffaa00"))
-                except requests.exceptions.ConnectionError:
-                    win.after(0, lambda: conn_lbl.config(
-                        text=f"Unreachable: {host}", fg="#ff5555"))
-                except requests.exceptions.Timeout:
-                    win.after(0, lambda: conn_lbl.config(
-                        text=f"Timed out: {host}", fg="#ff5555"))
-                except Exception as exc:
-                    win.after(0, lambda: conn_lbl.config(
-                        text=f"Error: {exc}", fg="#ff5555"))
+        if not has_bundled:
+            tk.Label(spotify_frame, text="Client ID:", font=("Segoe UI", 9),
+                     fg="#7878a0", bg="#0f0f16").grid(row=0, column=0, sticky="e", padx=(0,6), pady=2)
+            tk.Entry(spotify_frame, textvariable=sp_client_id_var, width=28,
+                     font=("Segoe UI", 9), bg="#06060a", fg="#ffffff",
+                     insertbackground="#5ce1e6", relief=tk.FLAT,
+                     highlightthickness=1, highlightbackground="#1c1c28"
+                     ).grid(row=0, column=1, sticky="w", pady=2)
 
-            threading.Thread(target=_do_test, daemon=True).start()
+            tk.Label(spotify_frame, text="Client Secret:", font=("Segoe UI", 9),
+                     fg="#7878a0", bg="#0f0f16").grid(row=1, column=0, sticky="e", padx=(0,6), pady=2)
+            tk.Entry(spotify_frame, textvariable=sp_client_sec_var, width=28,
+                     font=("Segoe UI", 9), bg="#06060a", fg="#ffffff", show="*",
+                     insertbackground="#5ce1e6", relief=tk.FLAT,
+                     highlightthickness=1, highlightbackground="#1c1c28"
+                     ).grid(row=1, column=1, sticky="w", pady=2)
 
-        tk.Button(test_row, text="Test Connection", font=("Segoe UI", 9),
-                  bg="#0f2a3a", fg="#44bbee", relief=tk.FLAT, cursor="hand2",
-                  padx=8, pady=3, command=_test_connection).pack(side=tk.RIGHT)
+            tk.Label(spotify_frame,
+                     text="Redirect URI to add in your Spotify app:  http://127.0.0.1:8080",
+                     font=("Segoe UI", 8), fg="#5ce1e6", bg="#0f0f16"
+                     ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 2))
+
+            tk.Label(spotify_frame,
+                     text="Get credentials at developer.spotify.com/dashboard",
+                     font=("Segoe UI", 8), fg="#404054", bg="#0f0f16"
+                     ).grid(row=3, column=0, columnspan=2, sticky="w")
+        else:
+            tk.Label(spotify_frame,
+                     text="Click Connect and log in with your Spotify account.",
+                     font=("Segoe UI", 9), fg="#7878a0", bg="#0f0f16"
+                     ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        btn_row = tk.Frame(spotify_frame, bg="#0f0f16")
+        btn_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 2))
+
+        def _connect_spotify():
+            # Save credentials first so SpotifyAPI can read them
+            config["spotify_client_id"]     = sp_client_id_var.get().strip()
+            config["spotify_client_secret"] = sp_client_sec_var.get().strip()
+            save_config(config)
+            threading.Thread(target=lambda: self._append_message(
+                "system", spotify_api.authorize()), daemon=True).start()
+
+        sp_status = "✅ Connected" if config.get("spotify_refresh_token") else "Not connected"
+        tk.Label(btn_row, text=sp_status, font=("Segoe UI", 8),
+                 fg="#44cc66" if "Connected" in sp_status else "#666680",
+                 bg="#0f0f16").pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Button(btn_row, text="Connect / Re-authorize",
+                  font=("Segoe UI", 9), fg="#ffffff", bg="#1db954",
+                  bd=0, cursor="hand2", padx=10, pady=3,
+                  command=_connect_spotify).pack(side=tk.LEFT)
+
+        def _open_spotify_dev(*_):
+            run_browser_action("browse_navigate",
+                               {"url": "https://developer.spotify.com/dashboard"})
+
+        tk.Button(btn_row, text="Dashboard ↗",
+                  font=("Segoe UI", 9), fg="#5ce1e6", bg="#0f0f16",
+                  bd=0, cursor="hand2", padx=8, pady=3,
+                  command=_open_spotify_dev).pack(side=tk.LEFT, padx=(6, 0))
+
+        # ── Row 8: Google Calendar ─────────────────────────────────────────────
+        _lbl(8, "Google Calendar:")
+        gcal_frame = tk.Frame(main_layer, bg="#0f0f16")
+        gcal_frame.grid(row=8, column=1, padx=6, pady=8, sticky="w")
+
+        gcal_path_var = tk.StringVar(value=config.get("google_calendar_credentials_path", ""))
+
+        tk.Label(gcal_frame, text="credentials.json:", font=("Segoe UI", 9),
+                 fg="#7878a0", bg="#0f0f16").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=2)
+
+        gcal_entry = tk.Entry(gcal_frame, textvariable=gcal_path_var, width=26,
+                              font=("Segoe UI", 9), bg="#06060a", fg="#ffffff",
+                              insertbackground="#5ce1e6", relief=tk.FLAT,
+                              highlightthickness=1, highlightbackground="#1c1c28")
+        gcal_entry.grid(row=0, column=1, sticky="w", pady=2)
+
+        def _browse_gcal():
+            from tkinter import filedialog
+            p = filedialog.askopenfilename(
+                parent=win, title="Select Google OAuth credentials.json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+            if p:
+                gcal_path_var.set(p)
+
+        tk.Button(gcal_frame, text="Browse…", font=("Segoe UI", 9),
+                  bg="#1a2a4a", fg="#5c9aff", relief=tk.FLAT, cursor="hand2",
+                  padx=6, pady=2, command=_browse_gcal).grid(row=0, column=2, padx=(4, 0), pady=2)
+
+        tk.Label(gcal_frame,
+                 text="Get credentials at console.cloud.google.com → APIs & Services → Credentials",
+                 font=("Segoe UI", 8), fg="#404054", bg="#0f0f16"
+                 ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 2))
+
+        gcal_btn_row = tk.Frame(gcal_frame, bg="#0f0f16")
+        gcal_btn_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 2))
+
+        gcal_status = ("✅ Connected" if CalendarManager.GOOGLE_TOKEN_FILE.exists()
+                       and config.get("google_calendar_credentials_path") else "Not connected")
+        gcal_status_lbl = tk.Label(gcal_btn_row, text=gcal_status, font=("Segoe UI", 8),
+                                   fg="#44cc66" if "Connected" in gcal_status else "#666680",
+                                   bg="#0f0f16")
+        gcal_status_lbl.pack(side=tk.LEFT, padx=(0, 10))
+
+        def _connect_gcal():
+            config["google_calendar_credentials_path"] = gcal_path_var.get().strip()
+            save_config(config)
+            threading.Thread(target=lambda: self._append_message(
+                "system", calendar_manager.google_authorize()), daemon=True).start()
+
+        tk.Button(gcal_btn_row, text="Connect / Re-authorize",
+                  font=("Segoe UI", 9), fg="#ffffff", bg="#4285f4",
+                  bd=0, cursor="hand2", padx=10, pady=3,
+                  command=_connect_gcal).pack(side=tk.LEFT)
+
+        # ── Row 9: Apple Calendar ──────────────────────────────────────────────
+        _lbl(9, "Apple Calendar:")
+        acal_frame = tk.Frame(main_layer, bg="#0f0f16")
+        acal_frame.grid(row=9, column=1, padx=6, pady=8, sticky="w")
+
+        acal_user_var = tk.StringVar(value=config.get("icloud_calendar_user", ""))
+        acal_pass_var = tk.StringVar(value=config.get("icloud_calendar_password", ""))
+
+        tk.Label(acal_frame, text="Apple ID:", font=("Segoe UI", 9),
+                 fg="#7878a0", bg="#0f0f16").grid(row=0, column=0, sticky="e", padx=(0, 6), pady=2)
+        tk.Entry(acal_frame, textvariable=acal_user_var, width=28,
+                 font=("Segoe UI", 9), bg="#06060a", fg="#ffffff",
+                 insertbackground="#5ce1e6", relief=tk.FLAT,
+                 highlightthickness=1, highlightbackground="#1c1c28"
+                 ).grid(row=0, column=1, sticky="w", pady=2)
+
+        tk.Label(acal_frame, text="App Password:", font=("Segoe UI", 9),
+                 fg="#7878a0", bg="#0f0f16").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=2)
+        tk.Entry(acal_frame, textvariable=acal_pass_var, width=28, show="*",
+                 font=("Segoe UI", 9), bg="#06060a", fg="#ffffff",
+                 insertbackground="#5ce1e6", relief=tk.FLAT,
+                 highlightthickness=1, highlightbackground="#1c1c28"
+                 ).grid(row=1, column=1, sticky="w", pady=2)
+
+        tk.Label(acal_frame,
+                 text="Use an App-Specific Password from appleid.apple.com (not your main password)",
+                 font=("Segoe UI", 8), fg="#5ce1e6", bg="#0f0f16"
+                 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 2))
+
+        acal_btn_row = tk.Frame(acal_frame, bg="#0f0f16")
+        acal_btn_row.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 2))
+
+        acal_status = ("✅ Credentials saved" if config.get("icloud_calendar_user")
+                       and config.get("icloud_calendar_password") else "Not connected")
+        acal_status_lbl = tk.Label(acal_btn_row, text=acal_status, font=("Segoe UI", 8),
+                                   fg="#44cc66" if "saved" in acal_status else "#666680",
+                                   bg="#0f0f16")
+        acal_status_lbl.pack(side=tk.LEFT, padx=(0, 10))
+
+        def _connect_apple():
+            config["icloud_calendar_user"]     = acal_user_var.get().strip()
+            config["icloud_calendar_password"] = acal_pass_var.get().strip()
+            save_config(config)
+            threading.Thread(target=lambda: self._append_message(
+                "system", calendar_manager.apple_connect()), daemon=True).start()
+
+        tk.Button(acal_btn_row, text="Test Connection",
+                  font=("Segoe UI", 9), fg="#ffffff", bg="#555566",
+                  bd=0, cursor="hand2", padx=10, pady=3,
+                  command=_connect_apple).pack(side=tk.LEFT)
 
         # ── Save ───────────────────────────────────────────────────────────────
         def save():
-            global _tts_voice, _ollama_host, OLLAMA_URL, OLLAMA_EMBED_URL
+            global _tts_voice, _ollama_host, OLLAMA_URL, OLLAMA_EMBED_URL, _active_hosts
             config["hotkey"] = hk_var.get().strip()
             config["tts_voice"] = _KOKORO_VOICES.get(voice_var.get(), "bm_george")
             config["default_mic_mode"] = mic_mode_var.get()
             config["tts_muted_default"] = not voice_on_var.get()
-            config["ollama_hosts"] = list(_all_hosts)
-            if config.get("ollama_host") not in _all_hosts:
-                config["ollama_host"] = _all_hosts[0] if _all_hosts else "localhost"
-            _tts_voice = config["tts_voice"]
-            _ollama_host = config["ollama_host"]
-            OLLAMA_URL = f"http://{_ollama_host}:11434/api/chat"
-            OLLAMA_EMBED_URL = f"http://{_ollama_host}:11434/api/embeddings"
+            # Persist all hosts and which ones are checked (active)
+            all_h   = [_normalize_ollama_host(h) for h in _all_hosts]
+            active_h = [h for h in all_h if _host_vars.get(h, tk.BooleanVar(value=True)).get()]
+            if not active_h:          # ensure at least one host is active
+                active_h = all_h[:1]
+            config["ollama_hosts"]        = all_h
+            config["ollama_active_hosts"] = active_h
+            config["ollama_host"]         = active_h[0]   # backward compat
+            # Persist per-host GPU layer counts and roles
+            host_settings = config.get("ollama_host_settings", {})
+            for h in all_h:
+                try:
+                    gpu_val = int(_host_gpu_vars.get(h, tk.StringVar(value="999")).get())
+                except ValueError:
+                    gpu_val = 999
+                role_val = _host_role_vars.get(h, tk.StringVar(value="all")).get()
+                host_settings[h] = {**host_settings.get(h, {}),
+                                    "num_gpu": gpu_val, "role": role_val}
+            config["ollama_host_settings"] = host_settings
+            _active_hosts    = active_h
+            # Restart pool workers — only pool/all-role hosts participate
+            ollama_pool.start(_pool_hosts())
+            _tts_voice       = config["tts_voice"]
+            _ollama_host     = active_h[0]
+            OLLAMA_URL       = _ollama_base_url(_ollama_host) + "/api/chat"
+            OLLAMA_EMBED_URL = _ollama_base_url(_ollama_host) + "/api/embeddings"
+            config["spotify_client_id"]              = sp_client_id_var.get().strip()
+            config["spotify_client_secret"]           = sp_client_sec_var.get().strip()
+            config["google_calendar_credentials_path"] = gcal_path_var.get().strip()
+            config["icloud_calendar_user"]             = acal_user_var.get().strip()
+            config["icloud_calendar_password"]         = acal_pass_var.get().strip()
             save_config(config)
             win.destroy()
             self._append_message("system",
@@ -3993,7 +6365,7 @@ class AssistantApp:
         tk.Button(main_layer, text="Save State", font=("Segoe UI Semibold", 9),
                   bg="#4747b2", fg="white", relief=tk.FLAT, padx=16, pady=6,
                   cursor="hand2", command=save
-                  ).grid(row=7, column=1, pady=14, padx=6, sticky="e")
+                  ).grid(row=10, column=1, pady=14, padx=6, sticky="e")
 
         win.update_idletasks()
         win.geometry(f"540x{win.winfo_reqheight() + 12}")
@@ -4070,9 +6442,6 @@ if __name__ == "__main__":
     _ui_app = app
     register_hotkey(app)
     start_tray(app)
-
-    _boot_ms = (_time.perf_counter() - _BOOT_START) * 1000
-    print(f"Boot time: {_boot_ms / 1000:.3f}s ({_boot_ms:.0f}ms)")
 
     app.show()
     app.run()
