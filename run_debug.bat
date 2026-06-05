@@ -1,6 +1,26 @@
 @echo off
+chcp 65001 >nul 2>&1
+echo ============================================================
+echo   Jarvis AI  ^|  Diagnostic Check
+echo ============================================================
+echo.
+echo   Is this the HOST machine (running Jarvis) or
+echo   a GUEST machine (running Ollama as a worker)?
+echo.
+echo   1 = HOST   (full Jarvis assistant diagnostics)
+echo   2 = GUEST  (Ollama worker / guest machine diagnostics)
+echo.
+set /p MACHINE_MODE="  Enter 1 or 2: "
+if "%MACHINE_MODE%"=="2" goto :GUEST_MODE
+if "%MACHINE_MODE%"=="guest" goto :GUEST_MODE
+
+:: ════════════════════════════════════════════════════════════
+::  HOST MODE  —  original full diagnostic
+:: ════════════════════════════════════════════════════════════
+:HOST_MODE
+echo.
 echo ============================================
-echo   AI File Assistant  ^|  DEV MODE
+echo   AI File Assistant  ^|  DEV MODE  (HOST)
 echo ============================================
 echo.
 
@@ -25,7 +45,7 @@ REM =====================================================================
 echo [1/3] Installing / verifying dependencies...
 echo       (verbose - all pip output shown)
 echo.
-pip install ^
+pip install --upgrade ^
     faster-whisper ^
     numpy ^
     requests ^
@@ -96,12 +116,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "try { $r=Invoke-WebRequest -Uri 'http://localhost:11434' -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop; Log ('  [OK]  Ollama reachable - HTTP '+$r.StatusCode) } catch { Log ('  [!!]  Ollama NOT reachable: '+$_.Exception.Message); Log '        All AI responses will fail. Start Ollama first.' };" ^
     "Log '';" ^
     "Log '--- 6. OLLAMA MODELS ------------------------------------------';" ^
-    "Log '  Required: qwen2.5:1.5b  qwen2.5:7b  deepseek-r1:7b  nomic-embed-text';" ^
+    "Log '  Required: llama3.2:3b  qwen3:4b  deepseek-r1:8b  nomic-embed-text';" ^
     "try {" ^
     "  $mj=Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop;" ^
     "  $ml=($mj.Content | ConvertFrom-Json).models | ForEach-Object { $_.name };" ^
     "  Log ('  Installed ('+@($ml).Count+' total): '+($ml -join ',  '));" ^
-    "  foreach ($req in @('qwen2.5:1.5b','qwen2.5:7b','deepseek-r1:7b','nomic-embed-text')) { if ($ml -contains $req) { Log ('  [OK]  '+$req) } else { Log ('  [!!]  '+$req+' MISSING  -->  ollama pull '+$req) } }" ^
+    "  foreach ($req in @('llama3.2:3b','qwen3:4b','deepseek-r1:8b','nomic-embed-text')) { if ($ml -contains $req) { Log ('  [OK]  '+$req) } else { Log ('  [!!]  '+$req+' MISSING  -->  ollama pull '+$req) } }" ^
     "} catch { Log '  [!!]  Could not query model list (Ollama not running?)' };" ^
     "Log ''"
 
@@ -269,5 +289,131 @@ python -u -W all -X dev assistant.py
 powershell -NoProfile -Command ^
     "Add-Content '%CONVLOG%' ('[' + (Get-Date -Format 'HH:mm:ss') + '] [====] SESSION END ====') -Encoding UTF8" 2>nul
 
+echo.
+pause
+goto :EOF
+
+:: ════════════════════════════════════════════════════════════
+::  GUEST MODE  —  Ollama worker machine diagnostics
+:: ════════════════════════════════════════════════════════════
+:GUEST_MODE
+echo.
+echo ============================================================
+echo   Jarvis AI  ^|  Guest Worker Machine Diagnostics
+echo ============================================================
+echo.
+
+cd /d "%~dp0"
+if not exist logs mkdir logs
+
+powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss" > "%TEMP%\jv_ts.tmp"
+set /p GUESTTS=<"%TEMP%\jv_ts.tmp"
+del "%TEMP%\jv_ts.tmp" 2>nul
+set GUESTLOG=logs\guest_diag_%GUESTTS%.log
+
+echo   Log: %GUESTLOG%
+echo.
+
+:: ── Block G1: System, Ollama binary, service ─────────────────
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "function Log([string]$m){Write-Host $m; Add-Content '%GUESTLOG%' $m -Encoding ascii};" ^
+    "Log '================================================================';" ^
+    "Log '  GUEST WORKER MACHINE  -  Jarvis AI Diagnostic';" ^
+    "Log '================================================================';" ^
+    "Log ('  Started : ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'));" ^
+    "Log '';" ^
+    "Log '--- G1. SYSTEM INFO -------------------------------------------';" ^
+    "Log ('  Host    : ' + $env:COMPUTERNAME);" ^
+    "Log ('  User    : ' + $env:USERNAME);" ^
+    "Log ('  OS      : ' + [Environment]::OSVersion.VersionString);" ^
+    "try { $ram=(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory; Log ('  RAM     : '+[math]::Round($ram/1GB,1)+' GB') } catch {};" ^
+    "try { $d=Get-PSDrive C; Log ('  Disk C: : '+[math]::Round($d.Free/1GB,1)+' GB free') } catch {};" ^
+    "Log '';" ^
+    "Log '--- G2. OLLAMA BINARY -----------------------------------------';" ^
+    "$ob=(Get-Command ollama -ErrorAction SilentlyContinue);" ^
+    "if ($ob) {" ^
+    "  Log ('  [OK]  Found : '+$ob.Source);" ^
+    "  $ver=(ollama --version 2>&1); Log ('  [OK]  Version: '+$ver)" ^
+    "} else {" ^
+    "  Log '  [!!]  ollama NOT FOUND on PATH';" ^
+    "  Log '        Run setup_guest_machine.bat to install Ollama.';" ^
+    "};" ^
+    "Log '';" ^
+    "Log '--- G3. OLLAMA SERVICE (port 11434) ---------------------------';" ^
+    "$proc=Get-Process -Name 'ollama' -ErrorAction SilentlyContinue;" ^
+    "if ($proc) { Log ('  [OK]  ollama process running  PID: '+$proc.Id) } else { Log '  [!!]  ollama process NOT running  -->  run: ollama serve' };" ^
+    "try {" ^
+    "  $t=New-Object Net.Sockets.TcpClient; $a=$t.BeginConnect('127.0.0.1',11434,$null,$null);" ^
+    "  $ok=$a.AsyncWaitHandle.WaitOne(500,$false); $t.Close();" ^
+    "  if ($ok) { Log '  [OK]  Port 11434 OPEN locally' } else { Log '  [!!]  Port 11434 CLOSED  -->  start ollama serve' }" ^
+    "} catch { Log '  [!!]  Port 11434 CLOSED  -->  start ollama serve' };" ^
+    "Log ''"
+
+:: ── Block G2: Models, GPU, firewall, auto-start ──────────────
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "function Log([string]$m){Write-Host $m; Add-Content '%GUESTLOG%' $m -Encoding ascii};" ^
+    "Log '--- G4. INSTALLED MODELS --------------------------------------';" ^
+    "Log '  Required: llama3.2:3b  qwen3:4b  deepseek-r1:8b  nomic-embed-text';" ^
+    "try {" ^
+    "  $mj=Invoke-WebRequest -Uri 'http://localhost:11434/api/tags' -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop;" ^
+    "  $ml=($mj.Content | ConvertFrom-Json).models | ForEach-Object { $_.name };" ^
+    "  Log ('  Total installed: '+@($ml).Count);" ^
+    "  foreach ($req in @('llama3.2:3b','qwen3:4b','deepseek-r1:8b','nomic-embed-text')) {" ^
+    "    if ($ml -contains $req) { Log ('  [OK]  '+$req) }" ^
+    "    else { Log ('  [!!]  '+$req+' MISSING  -->  ollama pull '+$req) }" ^
+    "  }" ^
+    "} catch { Log '  [!!]  Cannot query models (Ollama not running?)'; Log '        Start Ollama: ollama serve' };" ^
+    "Log '';" ^
+    "Log '--- G5. GPU / CUDA --------------------------------------------';" ^
+    "try {" ^
+    "  $gpu=Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object {$_.Name -notmatch 'Microsoft|Basic'};" ^
+    "  $gpu | ForEach-Object {" ^
+    "    $vram=[math]::Round($_.AdapterRAM/1GB,1);" ^
+    "    Log ('  GPU  : '+$_.Name);" ^
+    "    Log ('  VRAM : '+$vram+' GB (reported by WMI)');" ^
+    "  }" ^
+    "} catch { Log '  (WMI GPU query failed)' };" ^
+    "try { $nv=(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>&1); if ($LASTEXITCODE -eq 0) { Log ('  nvidia-smi: '+$nv) } } catch {};" ^
+    "Log '';" ^
+    "Log '--- G6. FIREWALL RULE -----------------------------------------';" ^
+    "try {" ^
+    "  $rules=Get-NetFirewallRule -DisplayName '*Ollama*' -ErrorAction SilentlyContinue;" ^
+    "  if ($rules) {" ^
+    "    $rules | ForEach-Object { Log ('  [OK]  Rule found: '+$_.DisplayName+' ('+$_.Enabled+')') }" ^
+    "  } else {" ^
+    "    Log '  [!!]  No Ollama firewall rule found';" ^
+    "    Log '        Host PC cannot connect. Fix: run setup_guest_machine.bat';" ^
+    "    Log '        Or manually: netsh advfirewall firewall add rule name=\"Ollama AI Server\" dir=in action=allow protocol=TCP localport=11434'" ^
+    "  }" ^
+    "} catch { Log '  (firewall check requires admin — re-run as Administrator)' };" ^
+    "Log '';" ^
+    "Log '--- G7. AUTO-START CONFIGURATION ------------------------------';" ^
+    "try {" ^
+    "  $rk=(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -ErrorAction Stop);" ^
+    "  if ($rk.OllamaAIServer) { Log ('  [OK]  Registry startup entry: '+$rk.OllamaAIServer) }" ^
+    "  else { Log '  [ ]   No registry auto-start entry for Ollama' }" ^
+    "} catch { Log '  [ ]   Could not read startup registry' };" ^
+    "try {" ^
+    "  $task=Get-ScheduledTask -TaskName 'Ollama AI Server' -ErrorAction SilentlyContinue;" ^
+    "  if ($task) { Log ('  [OK]  Task Scheduler entry found: '+$task.TaskName+' ('+$task.State+')') }" ^
+    "} catch {};" ^
+    "Log '';" ^
+    "Log '--- G8. NETWORK ADDRESSES (share one with host Jarvis) --------';" ^
+    "Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'} | ForEach-Object { Log ('  '+$_.IPAddress+':11434  (adapter: '+$_.InterfaceAlias+')') };" ^
+    "Log '';" ^
+    "Log '--- G9. CONNECTIVITY FROM HOST --------------------------------';" ^
+    "Log '  To test from the HOST PC, run in PowerShell:';" ^
+    "Log '    Invoke-WebRequest -Uri http://<THIS_IP>:11434/api/tags';" ^
+    "Log '  If it fails: check firewall rule (G6) and that ollama serve is running (G3).';" ^
+    "Log '';" ^
+    "Log '================================================================';" ^
+    "Log '  END OF GUEST DIAGNOSTICS';" ^
+    "Log '================================================================';" ^
+    "Log ''"
+
+echo.
+echo ================================================================
+echo   Guest diagnostics complete.  Log: %GUESTLOG%
+echo ================================================================
 echo.
 pause
